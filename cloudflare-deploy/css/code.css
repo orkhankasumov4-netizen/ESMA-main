@@ -1,0 +1,36 @@
+/* Code Editor Page Styles */
+.code-layout {
+  display: flex;
+  height: 100%;
+}
+
+.code-layout > div {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--glass-border);
+}
+
+#monaco-editor-container {
+  min-height: 300px;
+}
+
+#code-console {
+  color: #e0e0e0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Scrollbar styling for console */
+#code-console::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+#code-console::-webkit-scrollbar-track {
+  background: transparent;
+}
+#code-console::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+}
+#code-console::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}

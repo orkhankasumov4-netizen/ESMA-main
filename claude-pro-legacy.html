@@ -1,0 +1,4370 @@
+<!DOCTYPE html>
+<html lang="az" data-theme="dark">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Pro</title>
+  <script>
+    // ╔══════════════════════════════════════════════════════════════╗
+    // ║          AI FALLBACK ENGINE  (puter.js əvəzedicisi)          ║
+    // ║   OpenRouter → Qwen → Mistral → Gemini → OpenAI             ║
+    // ╚══════════════════════════════════════════════════════════════╝
+
+    // ── 1. PROXY VƏ ŞİFRƏ KONFİQURASİYASI ──────────────────────
+    const PROXY_URL = 'http://185.237.14.86:8081/proxy';
+    const PROXY_PASS = 'orxan519'; // Kamatera serverindəki .env ilə EYNİ olmalıdır
+
+    // ── 2. PROVAYEDER KONFİQURASİYASI ────────────────────────────
+    const AI_PROVIDERS = [
+      { name: 'OpenRouter', id: 'openrouter', model: 'openrouter/free', type: 'openai' },
+      { name: 'Qwen', id: 'qwen', model: 'qwen-turbo', type: 'openai' },
+      { name: 'Mistral', id: 'mistral', model: 'mistral-small-latest', type: 'openai' },
+      { name: 'Gemini', id: 'gemini', model: 'gemini-1.5-flash', type: 'gemini' },
+      { name: 'OpenAI', id: 'openai', model: 'gpt-4o-mini', type: 'openai' },
+      { name: 'Groq', id: 'groq', model: 'llama3-8b-8192', type: 'openai' },
+      { name: 'GitHub', id: 'github', model: 'gpt-4o-mini', type: 'openai' },
+    ];
+
+    // ── 3. YARDIMÇI: mesaj massivini normallaşdır ────────────────
+    function _buildMessages(input, system) {
+      const msgs = [];
+      if (system) msgs.push({ role: 'system', content: system });
+
+      if (typeof input === 'string') {
+        msgs.push({ role: 'user', content: input });
+      } else if (Array.isArray(input)) {
+        for (const m of input) {
+          if (m.role === 'system') continue; // artıq əlavə etdik
+          // Mürəkkəb content massivini (şəkil/fayl blokları) mətnə çevir
+          const content = typeof m.content === 'string'
+            ? m.content
+            : Array.isArray(m.content)
+              ? m.content
+                .filter(b => b.type === 'text')
+                .map(b => b.text)
+                .join('\n') || '[media fayl]'
+              : String(m.content);
+          msgs.push({ role: m.role, content });
+        }
+      }
+      return msgs;
+    }
+
+    // ── 4. OPENAI-UYĞUN: bir dəfəlik sorğu ──────────────────────
+    async function _callOpenAI(provider, messages) {
+      const res = await fetch(PROXY_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-proxy-pass': PROXY_PASS,
+          'x-provider': provider.id,
+        },
+        body: JSON.stringify({
+          model: provider.model,
+          messages,
+          max_tokens: 4096,
+        }),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} — ${txt.slice(0, 150)}`);
+      }
+      const data = await res.json();
+      return data.choices?.[0]?.message?.content ?? '';
+    }
+
+    // ── 5. OPENAI-UYĞUN: axınlı sorğu (SSE) ────────────────────
+    async function* _streamOpenAI(provider, messages) {
+      const res = await fetch(PROXY_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-proxy-pass': PROXY_PASS,
+          'x-provider': provider.id,
+        },
+        body: JSON.stringify({
+          model: provider.model,
+          messages,
+          stream: true,
+          max_tokens: 4096,
+        }),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} — ${txt.slice(0, 150)}`);
+      }
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop(); // natamam sətri gözlə
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (raw === '[DONE]') return;
+          try {
+            const json = JSON.parse(raw);
+            const text = json.choices?.[0]?.delta?.content ?? '';
+            if (text) yield { text };
+          } catch { /* zərər yoxdur */ }
+        }
+      }
+    }
+
+    // ── 6. GEMINI: bir dəfəlik sorğu (fərqli format) ────────────
+    async function _callGemini(provider, messages) {
+      // system mesajını ilk user mesajına birləşdir
+      const contents = [];
+      let sys = '';
+      for (const m of messages) {
+        if (m.role === 'system') { sys = m.content; continue; }
+        const text = sys ? `${sys}\n\n${m.content}` : m.content;
+        sys = '';
+        contents.push({
+          role: m.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text }],
+        });
+      }
+
+      const res = await fetch(PROXY_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-proxy-pass': PROXY_PASS,
+          'x-provider': provider.id
+        },
+        body: JSON.stringify({ model: provider.model, contents }),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(`Gemini HTTP ${res.status} — ${txt.slice(0, 150)}`);
+      }
+      const data = await res.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    }
+
+    // ── 7. GEMINI: axınlı sorğu (SSE) ───────────────────────────
+    async function* _streamGemini(provider, messages) {
+      const contents = [];
+      let sys = '';
+      for (const m of messages) {
+        if (m.role === 'system') { sys = m.content; continue; }
+        const text = sys ? `${sys}\n\n${m.content}` : m.content;
+        sys = '';
+        contents.push({
+          role: m.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text }],
+        });
+      }
+
+      const res = await fetch(PROXY_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-proxy-pass': PROXY_PASS,
+          'x-provider': provider.id
+        },
+        body: JSON.stringify({ model: provider.model, stream: true, contents }),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(`Gemini stream HTTP ${res.status} — ${txt.slice(0, 150)}`);
+      }
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const json = JSON.parse(line.slice(6));
+            const text = json.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+            if (text) yield { text };
+          } catch { /* zərər yoxdur */ }
+        }
+      }
+    }
+
+    // ── 8. FALLBACK DÖVRÜ: axınlı ────────────────────────────────
+    async function* _streamWithFallback(messages) {
+      for (const provider of AI_PROVIDERS) {
+        try {
+          console.log(`[AI] ▶ ${provider.name} stream cəhdi…`);
+          if (provider.type === 'gemini') {
+            yield* _streamGemini(provider, messages);
+          } else {
+            yield* _streamOpenAI(provider, messages);
+          }
+          console.log(`[AI] ✅ ${provider.name} uğurla tamamlandı`);
+          return;                                  // uğurlu çıxış
+        } catch (err) {
+          console.warn(`[AI] ⚠️ ${provider.name}: ${err.message} → növbəti provayder`);
+        }
+      }
+      throw new Error('Sistem xətası: bütün 5 provayder cavab vermədi.');
+    }
+
+    // ── 9. FALLBACK DÖVRÜ: bir dəfəlik ───────────────────────────
+    async function _callWithFallback(messages) {
+      for (const provider of AI_PROVIDERS) {
+        try {
+          console.log(`[AI] ▶ ${provider.name} cəhdi…`);
+          const result = provider.type === 'gemini'
+            ? await _callGemini(provider, messages)
+            : await _callOpenAI(provider, messages);
+          console.log(`[AI] ✅ ${provider.name} uğurlu`);
+          return result;
+        } catch (err) {
+          console.warn(`[AI] ⚠️ ${provider.name}: ${err.message} → növbəti provayder`);
+        }
+      }
+      throw new Error('Sistem xətası: bütün 5 provayder cavab vermədi.');
+    }
+
+    // ── 10. ANA FUNKSİYA — puter.ai.chat() TAM ƏVƏZEDİCİSİ ─────
+    //
+    //   await puter.ai.chat(mesajMassivi, { model, stream, system })
+    //   await puter.ai.chat('sual mətni', { system })
+    //
+    //   stream:true → async generator qaytarır (for await ... of)
+    //   stream:yox  → string qaytarır
+    //
+    async function aiChat(input, opts = {}) {
+      const messages = _buildMessages(input, opts.system ?? '');
+      if (opts.stream) {
+        return _streamWithFallback(messages);   // async generator
+      }
+      return await _callWithFallback(messages); // string
+    }
+
+    // ── 11. PUTER.JS UYĞUNLUQ ŞIMI ───────────────────────────────
+    //   Mövcud kodun heç bir sətri dəyişmədən işləməsi üçün
+    //   window.puter obyekti eyni interfeyslə qurulur.
+    window.puter = {
+      ai: {
+        chat: aiChat,
+      },
+    };
+
+    console.log('[AI] Fallback engine hazırdır. Sıra: OpenRouter → Qwen → Mistral → Gemini → OpenAI');
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link
+    href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0f0f0f;
+      --sidebar-bg: #0a0a0a;
+      --surface: #1a1a1a;
+      --surface2: #222;
+      --surface3: #2c2c2c;
+      --border: #2a2a2a;
+      --border2: #383838;
+      --text: #f0f0f0;
+      --text-muted: #5e5e5e;
+      --text-sub: #909090;
+      --accent: #e07b54;
+      --accent2: #c96d47;
+      --accent-glow: rgba(224, 123, 84, .15);
+      --green: #4ade80;
+      --red: #f87171;
+      --blue: #60a5fa;
+      --yellow: #fbbf24;
+      --purple: #a78bfa;
+      --code-bg: #111;
+      --radius: 12px;
+      --font: 'DM Sans', sans-serif;
+      --mono: 'JetBrains Mono', monospace;
+      --shadow: 0 4px 24px rgba(0, 0, 0, .5);
+      --t: .18s cubic-bezier(.4, 0, .2, 1);
+    }
+
+    [data-theme="light"] {
+      --bg: #fafafa;
+      --sidebar-bg: #f0f0f0;
+      --surface: #fff;
+      --surface2: #f5f5f5;
+      --surface3: #ebebeb;
+      --border: #e0e0e0;
+      --border2: #d0d0d0;
+      --text: #111;
+      --text-muted: #999;
+      --text-sub: #666;
+      --accent-glow: rgba(224, 123, 84, .1);
+      --code-bg: #f4f4f4;
+      --shadow: 0 4px 24px rgba(0, 0, 0, .08);
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      overflow: hidden;
+      font-size: 14px
+    }
+
+    /* ── SIDEBAR ── */
+    #sidebar {
+      width: 260px;
+      min-width: 260px;
+      background: var(--sidebar-bg);
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border);
+      transition: width var(--t), min-width var(--t);
+      overflow: hidden
+    }
+
+    #sidebar.collapsed {
+      width: 0;
+      min-width: 0
+    }
+
+    .sidebar-top {
+      padding: 14px 12px 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 8px
+    }
+
+    .logo-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--accent), #a05a3f);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      font-weight: 700;
+      color: #fff;
+      flex-shrink: 0
+    }
+
+    .logo-text {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -.3px
+    }
+
+    .icon-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 6px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background var(--t), color var(--t);
+      flex-shrink: 0
+    }
+
+    .icon-btn:hover {
+      background: var(--surface2);
+      color: var(--text)
+    }
+
+    .new-chat-btn {
+      margin: 6px 10px;
+      padding: 9px 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: all var(--t);
+      width: calc(100% - 20px)
+    }
+
+    .new-chat-btn:hover {
+      background: var(--surface2);
+      border-color: var(--border2)
+    }
+
+    .section-label {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-muted);
+      padding: 10px 14px 4px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between
+    }
+
+    .section-label button {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 5px;
+      font-family: var(--font);
+      transition: all var(--t)
+    }
+
+    .section-label button:hover {
+      background: var(--surface2);
+      color: var(--text)
+    }
+
+    #history-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0 6px 8px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--surface2) transparent;
+      min-height: 0
+    }
+
+    .history-item {
+      padding: 7px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      color: var(--text-sub);
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: all var(--t);
+      display: flex;
+      align-items: center;
+      gap: 6px
+    }
+
+    .history-item:hover {
+      background: var(--surface);
+      color: var(--text)
+    }
+
+    .history-item.active {
+      background: var(--surface2);
+      color: var(--text)
+    }
+
+    .history-item .del-conv {
+      margin-left: auto;
+      opacity: 0;
+      background: none;
+      border: none;
+      color: var(--red);
+      cursor: pointer;
+      padding: 2px 4px;
+      border-radius: 4px;
+      font-size: 11px;
+      flex-shrink: 0;
+      transition: opacity var(--t)
+    }
+
+    .history-item:hover .del-conv {
+      opacity: 1
+    }
+
+    /* ── MEMORY PANEL ── */
+    #memory-section {
+      flex-shrink: 0;
+      border-top: 1px solid var(--border);
+      max-height: 220px;
+      display: flex;
+      flex-direction: column
+    }
+
+    #memory-list {
+      overflow-y: auto;
+      padding: 4px 8px 8px;
+      scrollbar-width: thin
+    }
+
+    .memory-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 7px 10px;
+      margin-bottom: 5px;
+      font-size: 12px;
+      color: var(--text-sub);
+      display: flex;
+      gap: 6px;
+      align-items: flex-start;
+      transition: border-color var(--t)
+    }
+
+    .memory-card:hover {
+      border-color: var(--border2)
+    }
+
+    .memory-card .mem-text {
+      flex: 1;
+      line-height: 1.5
+    }
+
+    .memory-card .mem-del {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 11px;
+      padding: 1px 4px;
+      border-radius: 4px;
+      flex-shrink: 0;
+      transition: color var(--t);
+      line-height: 1
+    }
+
+    .memory-card .mem-del:hover {
+      color: var(--red)
+    }
+
+    .memory-add-row {
+      display: flex;
+      gap: 5px;
+      padding: 4px 8px 8px
+    }
+
+    .memory-add-row input {
+      flex: 1;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 6px 9px;
+      outline: none;
+      transition: border-color var(--t)
+    }
+
+    .memory-add-row input:focus {
+      border-color: var(--accent)
+    }
+
+    .memory-add-row input::placeholder {
+      color: var(--text-muted)
+    }
+
+    .memory-add-row button {
+      background: var(--accent);
+      border: none;
+      border-radius: 7px;
+      color: #fff;
+      cursor: pointer;
+      padding: 6px 10px;
+      font-size: 12px;
+      transition: background var(--t);
+      white-space: nowrap;
+      font-family: var(--font)
+    }
+
+    .memory-add-row button:hover {
+      background: var(--accent2)
+    }
+
+    .mem-empty {
+      padding: 8px 12px;
+      font-size: 11px;
+      color: var(--text-muted);
+      font-style: italic
+    }
+
+    /* ── SIDEBAR FOOTER ── */
+    .sidebar-footer {
+      padding: 10px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px
+    }
+
+    .sys-prompt-btn {
+      width: 100%;
+      padding: 8px 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-sub);
+      font-family: var(--font);
+      font-size: 12px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all var(--t)
+    }
+
+    .sys-prompt-btn:hover {
+      background: var(--surface2);
+      color: var(--text)
+    }
+
+    .theme-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 2px
+    }
+
+    .theme-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 5px
+    }
+
+    .toggle {
+      position: relative;
+      width: 36px;
+      height: 20px;
+      background: var(--surface3);
+      border-radius: 10px;
+      cursor: pointer;
+      border: 1px solid var(--border2);
+      transition: background var(--t)
+    }
+
+    .toggle.on {
+      background: var(--accent)
+    }
+
+    .toggle::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 14px;
+      height: 14px;
+      background: #fff;
+      border-radius: 50%;
+      transition: transform var(--t)
+    }
+
+    .toggle.on::after {
+      transform: translateX(16px)
+    }
+
+    /* ── MAIN ── */
+    #main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      overflow: hidden
+    }
+
+    #topbar {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      padding: 0 14px;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      background: var(--bg)
+    }
+
+    .topbar-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text);
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      padding: 0 4px
+    }
+
+    /* ── MODE TABS ── */
+    .mode-tabs {
+      display: flex;
+      gap: 2px;
+      padding: 0 4px
+    }
+
+    .mode-tab {
+      background: none;
+      border: 1px solid transparent;
+      color: var(--text-muted);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 5px 10px;
+      border-radius: 7px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      transition: all var(--t);
+      white-space: nowrap
+    }
+
+    .mode-tab:hover {
+      background: var(--surface);
+      color: var(--text)
+    }
+
+    .mode-tab.active {
+      background: var(--surface2);
+      border-color: var(--border2);
+      color: var(--text)
+    }
+
+    .mode-tab .tab-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: .5
+    }
+
+    .mode-tab.active .tab-dot {
+      opacity: 1
+    }
+
+    #model-select {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      outline: none;
+      transition: border-color var(--t)
+    }
+
+    #model-select:hover {
+      border-color: var(--border2)
+    }
+
+    #model-select option {
+      background: var(--sidebar-bg)
+    }
+
+    /* ── PANELS ── */
+    .panel {
+      flex: 1;
+      display: none;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden
+    }
+
+    .panel.active {
+      display: flex
+    }
+
+    /* ── CHAT PANEL ── */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 0 8px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--surface2) transparent
+    }
+
+    .msg-row {
+      max-width: 740px;
+      margin: 0 auto 20px;
+      padding: 0 20px;
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      animation: fadeUp .2s ease;
+      position: relative
+    }
+
+    @keyframes fadeUp {
+      from {
+        opacity: 0;
+        transform: translateY(8px)
+      }
+
+      to {
+        opacity: 1;
+        transform: none
+      }
+    }
+
+    .avatar {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 700;
+      margin-top: 1px
+    }
+
+    .avatar.user {
+      background: var(--surface3);
+      color: var(--text-sub)
+    }
+
+    .avatar.ai {
+      background: linear-gradient(135deg, var(--accent), #a05a3f);
+      color: #fff
+    }
+
+    .msg-body {
+      flex: 1;
+      min-width: 0
+    }
+
+    .msg-name {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 5px;
+      display: flex;
+      align-items: center;
+      gap: 8px
+    }
+
+    .msg-text {
+      font-size: 14px;
+      line-height: 1.7;
+      color: var(--text);
+      word-break: break-word
+    }
+
+    .msg-actions {
+      display: none;
+      position: absolute;
+      right: 20px;
+      top: 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 3px;
+      gap: 2px;
+      flex-direction: row;
+      box-shadow: var(--shadow)
+    }
+
+    .msg-row:hover .msg-actions {
+      display: flex
+    }
+
+    .msg-action-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 5px 7px;
+      border-radius: 6px;
+      font-size: 11px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: all var(--t);
+      white-space: nowrap
+    }
+
+    .msg-action-btn:hover {
+      background: var(--surface2);
+      color: var(--text)
+    }
+
+    .msg-action-btn.danger:hover {
+      background: rgba(248, 113, 113, .1);
+      color: var(--red)
+    }
+
+    .edit-area {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      line-height: 1.7;
+      padding: 10px 12px;
+      resize: none;
+      outline: none;
+      min-height: 60px
+    }
+
+    .edit-btns {
+      display: flex;
+      gap: 6px;
+      margin-top: 6px
+    }
+
+    .edit-save {
+      padding: 5px 12px;
+      background: var(--accent);
+      border: none;
+      border-radius: 7px;
+      color: #fff;
+      font-family: var(--font);
+      font-size: 12px;
+      cursor: pointer
+    }
+
+    .edit-save:hover {
+      background: var(--accent2)
+    }
+
+    .edit-cancel {
+      padding: 5px 12px;
+      background: var(--surface3);
+      border: none;
+      border-radius: 7px;
+      color: var(--text-sub);
+      font-family: var(--font);
+      font-size: 12px;
+      cursor: pointer
+    }
+
+    .msg-files {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px
+    }
+
+    .msg-file-chip {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 5px 10px;
+      font-size: 12px;
+      color: var(--text-sub);
+      display: flex;
+      align-items: center;
+      gap: 6px
+    }
+
+    .msg-img-preview {
+      max-width: 280px;
+      max-height: 180px;
+      border-radius: 8px;
+      object-fit: cover;
+      border: 1px solid var(--border);
+      display: block;
+      margin-bottom: 8px
+    }
+
+    #welcome {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 40px;
+      text-align: center
+    }
+
+    #welcome h1 {
+      font-size: 26px;
+      font-weight: 600;
+      letter-spacing: -.5px
+    }
+
+    #welcome p {
+      font-size: 14px;
+      color: var(--text-muted);
+      max-width: 360px;
+      line-height: 1.7
+    }
+
+    .welcome-features {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      margin-top: 16px
+    }
+
+    .feat-chip {
+      padding: 7px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      font-size: 12px;
+      color: var(--text-sub);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: default;
+      transition: all var(--t)
+    }
+
+    .feat-chip:hover {
+      border-color: var(--accent);
+      color: var(--text)
+    }
+
+    /* ── CODE BLOCKS ── */
+    .code-block {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin: 10px 0;
+      overflow: hidden
+    }
+
+    .code-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 7px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface)
+    }
+
+    .code-lang {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--accent);
+      font-family: var(--mono);
+      letter-spacing: .5px
+    }
+
+    .code-btns {
+      display: flex;
+      gap: 5px
+    }
+
+    .code-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text-sub);
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-family: var(--font);
+      transition: all var(--t);
+      display: flex;
+      align-items: center;
+      gap: 4px
+    }
+
+    .code-btn:hover {
+      background: var(--surface3);
+      color: var(--text)
+    }
+
+    .code-btn.run {
+      color: var(--green);
+      border-color: rgba(74, 222, 128, .3)
+    }
+
+    .code-btn.run:hover {
+      background: rgba(74, 222, 128, .1)
+    }
+
+    pre {
+      padding: 14px 16px;
+      overflow-x: auto
+    }
+
+    code {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: #e0e0e0;
+      line-height: 1.6
+    }
+
+    .code-output {
+      border-top: 1px solid var(--border);
+      background: #fff;
+      position: relative
+    }
+
+    .code-output iframe {
+      width: 100%;
+      min-height: 200px;
+      border: none;
+      display: block
+    }
+
+    .code-output-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 12px;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border)
+    }
+
+    .output-label {
+      font-size: 11px;
+      color: var(--green);
+      font-weight: 600
+    }
+
+    .close-output {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 14px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      transition: all var(--t)
+    }
+
+    .close-output:hover {
+      background: var(--surface3);
+      color: var(--text)
+    }
+
+    .cursor {
+      display: inline-block;
+      width: 2px;
+      height: 14px;
+      background: var(--accent);
+      border-radius: 1px;
+      animation: blink .8s infinite;
+      vertical-align: middle;
+      margin-left: 2px
+    }
+
+    @keyframes blink {
+
+      0%,
+      100% {
+        opacity: 1
+      }
+
+      50% {
+        opacity: 0
+      }
+    }
+
+    /* ── INPUT AREA ── */
+    #input-area {
+      padding: 10px 20px 16px;
+      flex-shrink: 0
+    }
+
+    #input-box {
+      max-width: 740px;
+      margin: 0 auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      transition: border-color var(--t), box-shadow var(--t)
+    }
+
+    #input-box:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow)
+    }
+
+    #file-strip {
+      display: none;
+      flex-wrap: wrap;
+      gap: 7px;
+      padding: 10px 12px 0
+    }
+
+    #file-strip.has-files {
+      display: flex
+    }
+
+    .file-pill {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 5px 10px;
+      font-size: 12px;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      max-width: 180px
+    }
+
+    .file-pill span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap
+    }
+
+    .file-pill button {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 13px;
+      flex-shrink: 0;
+      transition: color var(--t)
+    }
+
+    .file-pill button:hover {
+      color: var(--red)
+    }
+
+    .img-thumb-pill {
+      position: relative;
+      width: 48px;
+      height: 48px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border)
+    }
+
+    .img-thumb-pill img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover
+    }
+
+    .img-thumb-pill button {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      background: rgba(0, 0, 0, .75);
+      border: none;
+      color: #fff;
+      cursor: pointer;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      font-size: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center
+    }
+
+    #textarea {
+      width: 100%;
+      background: none;
+      border: none;
+      outline: none;
+      resize: none;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      line-height: 1.65;
+      padding: 13px 14px;
+      min-height: 50px;
+      max-height: 200px;
+      scrollbar-width: thin
+    }
+
+    #textarea::placeholder {
+      color: var(--text-muted)
+    }
+
+    .input-actions {
+      display: flex;
+      align-items: center;
+      padding: 7px 10px;
+      gap: 5px;
+      border-top: 1px solid var(--border)
+    }
+
+    .attach-btn,
+    .voice-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: 7px;
+      padding: 5px 9px;
+      cursor: pointer;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      transition: all var(--t);
+      font-family: var(--font)
+    }
+
+    .attach-btn:hover,
+    .voice-btn:hover {
+      background: var(--surface2);
+      color: var(--text);
+      border-color: var(--border2)
+    }
+
+    .voice-btn.recording {
+      border-color: var(--red);
+      color: var(--red);
+      background: rgba(248, 113, 113, .08);
+      animation: pulse 1.2s infinite
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        box-shadow: 0 0 0 0 rgba(248, 113, 113, .3)
+      }
+
+      50% {
+        box-shadow: 0 0 0 5px rgba(248, 113, 113, 0)
+      }
+    }
+
+    #file-input {
+      display: none
+    }
+
+    #send-btn {
+      margin-left: auto;
+      background: var(--accent);
+      border: none;
+      color: #fff;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all var(--t);
+      flex-shrink: 0
+    }
+
+    #send-btn:hover {
+      background: var(--accent2);
+      transform: scale(1.05)
+    }
+
+    #send-btn:disabled {
+      opacity: .35;
+      cursor: not-allowed;
+      transform: none
+    }
+
+    /* ── RESEARCH PANEL ── */
+    #research-panel {
+      padding: 20px;
+      overflow-y: auto;
+      scrollbar-width: thin
+    }
+
+    .research-header {
+      max-width: 740px;
+      margin: 0 auto 20px
+    }
+
+    .research-header h2 {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 6px
+    }
+
+    .research-header p {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.6
+    }
+
+    .research-input-box {
+      max-width: 740px;
+      margin: 0 auto 24px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      transition: border-color var(--t), box-shadow var(--t)
+    }
+
+    .research-input-box:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow)
+    }
+
+    #research-textarea {
+      width: 100%;
+      background: none;
+      border: none;
+      outline: none;
+      resize: none;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      line-height: 1.65;
+      padding: 14px 16px;
+      min-height: 80px;
+      max-height: 160px;
+      scrollbar-width: thin
+    }
+
+    #research-textarea::placeholder {
+      color: var(--text-muted)
+    }
+
+    .research-actions {
+      display: flex;
+      gap: 8px;
+      padding: 10px 14px;
+      border-top: 1px solid var(--border);
+      align-items: center
+    }
+
+    .research-depth {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 5px 10px;
+      border-radius: 7px;
+      outline: none;
+      cursor: pointer
+    }
+
+    .research-btn {
+      background: var(--accent);
+      border: none;
+      color: #fff;
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 500;
+      padding: 7px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all var(--t);
+      margin-left: auto
+    }
+
+    .research-btn:hover {
+      background: var(--accent2)
+    }
+
+    .research-btn:disabled {
+      opacity: .4;
+      cursor: not-allowed
+    }
+
+    .research-output {
+      max-width: 740px;
+      margin: 0 auto
+    }
+
+    .research-step {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      margin-bottom: 12px;
+      overflow: hidden;
+      animation: fadeUp .25s ease
+    }
+
+    .research-step-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 10px
+    }
+
+    .step-icon {
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      flex-shrink: 0
+    }
+
+    .step-icon.plan {
+      background: rgba(167, 139, 250, .15);
+      color: var(--purple)
+    }
+
+    .step-icon.query {
+      background: rgba(96, 165, 250, .15);
+      color: var(--blue)
+    }
+
+    .step-icon.synthesis {
+      background: rgba(224, 123, 84, .15);
+      color: var(--accent)
+    }
+
+    .step-icon.done {
+      background: rgba(74, 222, 128, .15);
+      color: var(--green)
+    }
+
+    .step-title {
+      font-size: 13px;
+      font-weight: 500
+    }
+
+    .step-badge {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 4px
+    }
+
+    .step-body {
+      padding: 14px 16px;
+      font-size: 13px;
+      line-height: 1.75;
+      color: var(--text-sub)
+    }
+
+    .step-body .msg-text {
+      font-size: 13px;
+      color: var(--text-sub)
+    }
+
+    .research-export-btn {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-sub);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 7px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-top: 8px;
+      transition: all var(--t)
+    }
+
+    .research-export-btn:hover {
+      background: var(--surface2);
+      color: var(--text)
+    }
+
+    /* ── CODE WORKSPACE ── */
+    #code-panel {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden
+    }
+
+    .code-workspace {
+      flex: 1;
+      display: flex;
+      min-height: 0;
+      overflow: hidden
+    }
+
+    .code-sidebar {
+      width: 190px;
+      min-width: 190px;
+      border-right: 1px solid var(--border);
+      background: var(--sidebar-bg);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden
+    }
+
+    .code-sidebar-header {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between
+    }
+
+    .code-sidebar-header button {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      padding: 0;
+      border-radius: 4px;
+      transition: color var(--t)
+    }
+
+    .code-sidebar-header button:hover {
+      color: var(--text)
+    }
+
+    .file-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px;
+      scrollbar-width: thin
+    }
+
+    .file-item {
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      color: var(--text-sub);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all var(--t);
+      font-family: var(--mono)
+    }
+
+    .file-item:hover {
+      background: var(--surface);
+      color: var(--text)
+    }
+
+    .file-item.active {
+      background: var(--surface2);
+      color: var(--text)
+    }
+
+    .file-item .file-del {
+      margin-left: auto;
+      opacity: 0;
+      background: none;
+      border: none;
+      color: var(--red);
+      cursor: pointer;
+      font-size: 10px;
+      padding: 1px 4px;
+      border-radius: 3px;
+      transition: opacity var(--t)
+    }
+
+    .file-item:hover .file-del {
+      opacity: 1
+    }
+
+    .code-editor-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden
+    }
+
+    .editor-tabs {
+      display: flex;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      background: var(--sidebar-bg);
+      overflow-x: auto;
+      scrollbar-width: none;
+      flex-shrink: 0
+    }
+
+    .editor-tab {
+      padding: 8px 14px;
+      font-size: 12px;
+      color: var(--text-muted);
+      cursor: pointer;
+      border-right: 1px solid var(--border);
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--mono);
+      transition: all var(--t);
+      flex-shrink: 0
+    }
+
+    .editor-tab:hover {
+      background: var(--surface);
+      color: var(--text)
+    }
+
+    .editor-tab.active {
+      background: var(--surface2);
+      color: var(--text);
+      border-bottom: 2px solid var(--accent)
+    }
+
+    .editor-tab .tab-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 12px;
+      padding: 0;
+      margin-left: 2px;
+      border-radius: 3px;
+      transition: color var(--t);
+      line-height: 1
+    }
+
+    .editor-tab .tab-close:hover {
+      color: var(--red)
+    }
+
+    .editor-container {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+      background: var(--code-bg)
+    }
+
+    .line-numbers {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 44px;
+      background: var(--code-bg);
+      border-right: 1px solid var(--border);
+      padding: 14px 0;
+      overflow: hidden;
+      pointer-events: none;
+      z-index: 1
+    }
+
+    .line-num {
+      display: block;
+      width: 100%;
+      text-align: right;
+      padding-right: 10px;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.6;
+      color: var(--text-muted);
+      opacity: .5
+    }
+
+    #code-editor {
+      position: absolute;
+      top: 0;
+      left: 44px;
+      right: 0;
+      bottom: 0;
+      background: none;
+      border: none;
+      outline: none;
+      color: #e0e0e0;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.6;
+      padding: 14px 16px;
+      resize: none;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--surface2) transparent;
+      white-space: pre;
+      tab-size: 2;
+      caret-color: var(--accent)
+    }
+
+    .code-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0
+    }
+
+    .code-tool-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text-sub);
+      font-size: 12px;
+      padding: 5px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: var(--font);
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      transition: all var(--t)
+    }
+
+    .code-tool-btn:hover {
+      background: var(--surface3);
+      color: var(--text)
+    }
+
+    .code-tool-btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff
+    }
+
+    .code-tool-btn.primary:hover {
+      background: var(--accent2)
+    }
+
+    .code-tool-btn.green {
+      color: var(--green);
+      border-color: rgba(74, 222, 128, .3)
+    }
+
+    .code-tool-btn.green:hover {
+      background: rgba(74, 222, 128, .1)
+    }
+
+    .code-run-output {
+      flex: 0 0 200px;
+      border-top: 1px solid var(--border);
+      overflow: hidden;
+      display: none;
+      flex-direction: column
+    }
+
+    .code-run-output.visible {
+      display: flex
+    }
+
+    .run-output-header {
+      padding: 6px 12px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--green);
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: space-between
+    }
+
+    .run-output-body {
+      flex: 1;
+      overflow-y: auto;
+      background: #fff
+    }
+
+    .run-output-body iframe {
+      width: 100%;
+      height: 100%;
+      border: none
+    }
+
+    .run-output-console {
+      flex: 1;
+      overflow-y: auto;
+      background: var(--code-bg);
+      padding: 10px 14px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: #e0e0e0;
+      white-space: pre-wrap
+    }
+
+    .code-ai-panel {
+      width: 280px;
+      min-width: 280px;
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden
+    }
+
+    .code-ai-header {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-sub);
+      display: flex;
+      align-items: center;
+      gap: 6px
+    }
+
+    .code-ai-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+      scrollbar-width: thin
+    }
+
+    .code-ai-msg {
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.65;
+      animation: fadeUp .15s ease
+    }
+
+    .code-ai-msg.user-msg {
+      background: var(--surface2);
+      color: var(--text-sub);
+      text-align: right
+    }
+
+    .code-ai-msg.ai-msg {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text)
+    }
+
+    .code-ai-input-area {
+      padding: 8px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 6px
+    }
+
+    .code-ai-input {
+      flex: 1;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 12px;
+      padding: 7px 10px;
+      outline: none;
+      resize: none;
+      min-height: 36px;
+      max-height: 100px;
+      transition: border-color var(--t)
+    }
+
+    .code-ai-input:focus {
+      border-color: var(--accent)
+    }
+
+    .code-ai-input::placeholder {
+      color: var(--text-muted)
+    }
+
+    .code-ai-send {
+      background: var(--accent);
+      border: none;
+      color: #fff;
+      border-radius: 7px;
+      padding: 7px 10px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: background var(--t);
+      flex-shrink: 0
+    }
+
+    .code-ai-send:hover {
+      background: var(--accent2)
+    }
+
+    .code-new-file {
+      padding: 8px 12px;
+      border-top: 1px solid var(--border)
+    }
+
+    .code-new-file input {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 5px 8px;
+      outline: none;
+      transition: border-color var(--t)
+    }
+
+    .code-new-file input:focus {
+      border-color: var(--accent)
+    }
+
+    .code-new-file input::placeholder {
+      color: var(--text-muted)
+    }
+
+    /* ── TASKS PANEL ── */
+    #tasks-panel {
+      padding: 20px;
+      overflow-y: auto;
+      scrollbar-width: thin
+    }
+
+    .tasks-header {
+      max-width: 740px;
+      margin: 0 auto 20px
+    }
+
+    .tasks-header h2 {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 6px
+    }
+
+    .tasks-header p {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.6
+    }
+
+    .task-add-box {
+      max-width: 740px;
+      margin: 0 auto 24px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      transition: border-color var(--t), box-shadow var(--t)
+    }
+
+    .task-add-box:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow)
+    }
+
+    #task-input {
+      width: 100%;
+      background: none;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      padding: 14px 16px;
+      scrollbar-width: thin
+    }
+
+    #task-input::placeholder {
+      color: var(--text-muted)
+    }
+
+    .task-add-actions {
+      display: flex;
+      gap: 8px;
+      padding: 10px 14px;
+      border-top: 1px solid var(--border)
+    }
+
+    .task-add-btn {
+      background: var(--accent);
+      border: none;
+      color: #fff;
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 500;
+      padding: 7px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      margin-left: auto;
+      transition: all var(--t);
+      display: flex;
+      align-items: center;
+      gap: 6px
+    }
+
+    .task-add-btn:hover {
+      background: var(--accent2)
+    }
+
+    .tasks-list {
+      max-width: 740px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px
+    }
+
+    .task-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      animation: fadeUp .2s ease;
+      transition: border-color var(--t)
+    }
+
+    .task-card:hover {
+      border-color: var(--border2)
+    }
+
+    .task-card-header {
+      padding: 12px 16px;
+      display: flex;
+      align-items: flex-start;
+      gap: 12px
+    }
+
+    .task-check {
+      width: 20px;
+      height: 20px;
+      border-radius: 6px;
+      border: 2px solid var(--border2);
+      background: none;
+      cursor: pointer;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all var(--t);
+      margin-top: 1px
+    }
+
+    .task-check.done {
+      background: var(--green);
+      border-color: var(--green)
+    }
+
+    .task-check.in-progress {
+      border-color: var(--accent);
+      animation: borderPulse 1.5s infinite
+    }
+
+    @keyframes borderPulse {
+
+      0%,
+      100% {
+        border-color: var(--accent)
+      }
+
+      50% {
+        border-color: var(--accent2);
+        box-shadow: 0 0 0 3px var(--accent-glow)
+      }
+    }
+
+    .task-info {
+      flex: 1;
+      min-width: 0
+    }
+
+    .task-title {
+      font-size: 14px;
+      font-weight: 500;
+      margin-bottom: 3px;
+      word-break: break-word
+    }
+
+    .task-title.done-text {
+      text-decoration: line-through;
+      color: var(--text-muted)
+    }
+
+    .task-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 8px
+    }
+
+    .task-status-badge {
+      padding: 2px 7px;
+      border-radius: 10px;
+      font-size: 10px;
+      font-weight: 600
+    }
+
+    .task-status-badge.pending {
+      background: rgba(251, 191, 36, .1);
+      color: var(--yellow)
+    }
+
+    .task-status-badge.progress {
+      background: rgba(224, 123, 84, .1);
+      color: var(--accent)
+    }
+
+    .task-status-badge.done {
+      background: rgba(74, 222, 128, .1);
+      color: var(--green)
+    }
+
+    .task-btns {
+      display: flex;
+      gap: 6px;
+      flex-shrink: 0
+    }
+
+    .task-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 11px;
+      padding: 4px 9px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: var(--font);
+      transition: all var(--t);
+      display: flex;
+      align-items: center;
+      gap: 4px
+    }
+
+    .task-btn:hover {
+      background: var(--surface2);
+      color: var(--text)
+    }
+
+    .task-btn.execute {
+      border-color: rgba(224, 123, 84, .4);
+      color: var(--accent)
+    }
+
+    .task-btn.execute:hover {
+      background: rgba(224, 123, 84, .1)
+    }
+
+    .task-btn.del:hover {
+      background: rgba(248, 113, 113, .1);
+      color: var(--red)
+    }
+
+    .task-steps {
+      border-top: 1px solid var(--border);
+      padding: 12px 16px
+    }
+
+    .task-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-size: 13px;
+      line-height: 1.6
+    }
+
+    .task-step:last-child {
+      margin-bottom: 0
+    }
+
+    .step-num {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      font-weight: 700;
+      flex-shrink: 0;
+      margin-top: 1px
+    }
+
+    .step-num.pending {
+      background: var(--surface2);
+      color: var(--text-muted);
+      border: 1px solid var(--border)
+    }
+
+    .step-num.current {
+      background: rgba(224, 123, 84, .15);
+      color: var(--accent);
+      border: 1px solid rgba(224, 123, 84, .3)
+    }
+
+    .step-num.done {
+      background: rgba(74, 222, 128, .15);
+      color: var(--green);
+      border: 1px solid rgba(74, 222, 128, .3)
+    }
+
+    .step-text {
+      color: var(--text-sub);
+      flex: 1
+    }
+
+    .step-text.current {
+      color: var(--text);
+      font-weight: 500
+    }
+
+    .step-text.done {
+      text-decoration: line-through;
+      color: var(--text-muted)
+    }
+
+    .task-ai-result {
+      border-top: 1px solid var(--border);
+      padding: 12px 16px;
+      font-size: 13px;
+      color: var(--text-sub);
+      line-height: 1.7;
+      background: var(--code-bg)
+    }
+
+    /* ── MODALS ── */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      backdrop-filter: blur(4px);
+      animation: fadeIn .15s ease
+    }
+
+    @keyframes fadeIn {
+      from {
+        opacity: 0
+      }
+
+      to {
+        opacity: 1
+      }
+    }
+
+    .modal-overlay.hidden {
+      display: none
+    }
+
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      width: 90%;
+      max-width: 520px;
+      box-shadow: var(--shadow);
+      animation: scaleIn .15s ease;
+      overflow: hidden
+    }
+
+    @keyframes scaleIn {
+      from {
+        opacity: 0;
+        transform: scale(.95)
+      }
+
+      to {
+        opacity: 1;
+        transform: none
+      }
+    }
+
+    .modal-header {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between
+    }
+
+    .modal-title {
+      font-size: 15px;
+      font-weight: 600
+    }
+
+    .modal-close {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 18px;
+      line-height: 1;
+      padding: 4px;
+      border-radius: 6px;
+      transition: all var(--t)
+    }
+
+    .modal-close:hover {
+      background: var(--surface2);
+      color: var(--text)
+    }
+
+    .modal-body {
+      padding: 18px
+    }
+
+    .modal-footer {
+      padding: 12px 18px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end
+    }
+
+    .modal-label {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-sub);
+      margin-bottom: 6px
+    }
+
+    .modal-textarea {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      line-height: 1.6;
+      padding: 12px;
+      resize: vertical;
+      outline: none;
+      min-height: 140px;
+      transition: border-color var(--t)
+    }
+
+    .modal-textarea:focus {
+      border-color: var(--accent)
+    }
+
+    .modal-select {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      padding: 9px 12px;
+      border-radius: 9px;
+      outline: none;
+      cursor: pointer;
+      margin-top: 12px
+    }
+
+    .btn-primary {
+      padding: 8px 16px;
+      background: var(--accent);
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-family: var(--font);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background var(--t)
+    }
+
+    .btn-primary:hover {
+      background: var(--accent2)
+    }
+
+    .btn-ghost {
+      padding: 8px 16px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-sub);
+      font-family: var(--font);
+      font-size: 13px;
+      cursor: pointer;
+      transition: all var(--t)
+    }
+
+    .btn-ghost:hover {
+      background: var(--surface3);
+      color: var(--text)
+    }
+
+    .export-options {
+      display: flex;
+      gap: 8px;
+      flex-direction: column
+    }
+
+    .export-opt {
+      padding: 10px 14px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      transition: all var(--t);
+      font-family: var(--font);
+      color: var(--text);
+      font-size: 13px
+    }
+
+    .export-opt:hover {
+      background: var(--surface3);
+      border-color: var(--border2)
+    }
+
+    .export-opt-icon {
+      font-size: 18px
+    }
+
+    .export-opt-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px
+    }
+
+    .export-opt-title {
+      font-weight: 500;
+      font-size: 13px
+    }
+
+    .export-opt-desc {
+      font-size: 11px;
+      color: var(--text-muted)
+    }
+
+    /* ── TOAST ── */
+    #toast {
+      position: fixed;
+      bottom: 70px;
+      left: 50%;
+      transform: translateX(-50%) translateY(12px);
+      background: var(--surface2);
+      color: var(--text);
+      padding: 9px 16px;
+      border-radius: 9px;
+      font-size: 12px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .25s, transform .25s;
+      z-index: 2000;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      white-space: nowrap
+    }
+
+    #toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0)
+    }
+
+    ::-webkit-scrollbar {
+      width: 5px
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--surface2);
+      border-radius: 3px
+    }
+
+    @media(max-width:640px) {
+      #sidebar {
+        display: none
+      }
+
+      .msg-row {
+        padding: 0 14px
+      }
+
+      #input-area {
+        padding: 8px 14px 12px
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <!-- SIDEBAR -->
+  <div id="sidebar">
+    <div class="sidebar-top">
+      <div class="logo">
+        <div class="logo-icon">C</div>
+        <span class="logo-text">Claude Pro</span>
+      </div>
+      <button class="icon-btn" onclick="toggleSidebar()" title="Yan paneli bağla">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="18" height="18" rx="2" />
+          <line x1="9" y1="3" x2="9" y2="21" />
+        </svg>
+      </button>
+    </div>
+
+    <button class="new-chat-btn" onclick="newChat()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <line x1="12" y1="5" x2="12" y2="19" />
+        <line x1="5" y1="12" x2="19" y2="12" />
+      </svg>
+      Yeni Sohbet
+    </button>
+
+    <div class="section-label">Tarixçə</div>
+    <div id="history-list">
+      <div style="padding:8px 10px;font-size:11px;color:var(--text-muted);font-style:italic">Hələ sohbet yoxdur</div>
+    </div>
+
+    <!-- MEMORY SECTION -->
+    <div id="memory-section">
+      <div class="section-label">
+        🧠 Yaddaş
+        <button onclick="autoExtractMemory()" title="Bu söhbetdən yaddaş çıxar">✦ Çıxar</button>
+      </div>
+      <div id="memory-list"></div>
+      <div class="memory-add-row">
+        <input type="text" id="memory-input" placeholder="Yaddaş əlavə et…"
+          onkeydown="if(event.key==='Enter')addMemoryFromInput()">
+        <button onclick="addMemoryFromInput()">+ Əlavə</button>
+      </div>
+    </div>
+
+    <div class="sidebar-footer">
+      <button class="sys-prompt-btn" onclick="openSysPromptModal()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3" />
+          <path
+            d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" />
+        </svg>
+        Sistem Promptu
+      </button>
+      <div class="theme-row">
+        <span class="theme-label">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="5" />
+            <line x1="12" y1="1" x2="12" y2="3" />
+            <line x1="12" y1="21" x2="12" y2="23" />
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+            <line x1="1" y1="12" x2="3" y2="12" />
+            <line x1="21" y1="12" x2="23" y2="12" />
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+          </svg>
+          Açıq tema
+        </span>
+        <div class="toggle" id="theme-toggle" onclick="toggleTheme()"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div id="main">
+    <div id="topbar">
+      <button class="icon-btn" onclick="toggleSidebar()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="18" height="18" rx="2" />
+          <line x1="9" y1="3" x2="9" y2="21" />
+        </svg>
+      </button>
+      <div class="mode-tabs">
+        <button class="mode-tab active" id="tab-chat" onclick="switchMode('chat')"><span class="tab-dot"></span>💬
+          Söhbet</button>
+        <button class="mode-tab" id="tab-research" onclick="switchMode('research')"><span class="tab-dot"></span>🔬
+          Araşdırma</button>
+        <button class="mode-tab" id="tab-code" onclick="switchMode('code')"><span class="tab-dot"></span>&lt;/&gt;
+          Kod</button>
+        <button class="mode-tab" id="tab-tasks" onclick="switchMode('tasks')"><span class="tab-dot"></span>✅
+          Tapşırıqlar</button>
+      </div>
+      <span class="topbar-title" id="topbar-title"></span>
+      <select id="model-select" onchange="currentModel=this.value">
+        <option value="claude-sonnet-4-5">Sonnet 4.5</option>
+        <option value="claude-opus-4-5">Opus 4.5</option>
+        <option value="claude-haiku-4-5">Haiku 4.5</option>
+        <option value="claude-sonnet-4-20250514">Sonnet 4</option>
+      </select>
+    </div>
+
+    <!-- ── CHAT PANEL ── -->
+    <div class="panel active" id="chat-panel" style="flex-direction:column">
+      <div id="messages">
+        <div id="welcome">
+          <div style="font-size:36px;margin-bottom:8px">✦</div>
+          <h1>Salam! Nə kömək edə bilərəm?</h1>
+          <p>Söhbet et, araşdır, kod yaz, tapşırıqları icra et — hər şeyə kömək edirəm.</p>
+          <div class="welcome-features">
+            <div class="feat-chip">🧠 Daimi Yaddaş</div>
+            <div class="feat-chip">🔬 Dərin Araşdırma</div>
+            <div class="feat-chip">&lt;/&gt; Kod Workspace</div>
+            <div class="feat-chip">✅ Cowork Tasks</div>
+            <div class="feat-chip">🎙️ Səslə Danış</div>
+            <div class="feat-chip">📎 Fayl Analiz</div>
+          </div>
+        </div>
+      </div>
+      <div id="input-area">
+        <div id="input-box">
+          <div id="file-strip"></div>
+          <textarea id="textarea" placeholder="Mesaj yaz… (Shift+Enter = yeni sətir)" rows="1"
+            oninput="autoResize(this);updateSendBtn()" onkeydown="handleKey(event)"></textarea>
+          <div class="input-actions">
+            <button class="attach-btn" onclick="document.getElementById('file-input').click()">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path
+                  d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
+              </svg>
+              Fayl
+            </button>
+            <button class="voice-btn" id="voice-btn" onclick="toggleVoice()">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" />
+                <path d="M19 10v2a7 7 0 01-14 0v-2" />
+                <line x1="12" y1="19" x2="12" y2="23" />
+                <line x1="8" y1="23" x2="16" y2="23" />
+              </svg>
+              Səs
+            </button>
+            <input type="file" id="file-input" multiple accept="image/*,.pdf,.txt,.md,.json,.csv,.js,.py,.html,.css"
+              onchange="handleFileSelect(event)">
+            <button id="send-btn" onclick="sendMessage()" disabled>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div style="text-align:center;font-size:11px;color:var(--text-muted);margin-top:6px">
+          Claude Pro · Yaddaş aktiv · <span id="memory-count-label">0 yaddaş</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── RESEARCH PANEL ── -->
+    <div class="panel" id="research-panel">
+      <div class="research-header">
+        <h2>🔬 Dərin Araşdırma</h2>
+        <p>Mövzunu daxil edin. Claude araşdırma planı quracaq, hər sualı təhlil edəcək və hərtərəfli hesabat
+          hazırlayacaq.</p>
+      </div>
+      <div class="research-input-box">
+        <textarea id="research-textarea"
+          placeholder="Araşdırma mövzusunu yazın… Məsələn: Azərbaycanda AI inkişafı, Quantum hesablama gələcəyi…"
+          oninput="autoResize(this)" onkeydown="if(event.key==='Enter'&&event.ctrlKey)startResearch()"></textarea>
+        <div class="research-actions">
+          <select class="research-depth" id="research-depth">
+            <option value="quick">⚡ Sürətli (3 mərhələ)</option>
+            <option value="standard" selected>📊 Standart (5 mərhələ)</option>
+            <option value="deep">🔭 Dərin (7 mərhələ)</option>
+          </select>
+          <button class="research-btn" id="research-btn" onclick="startResearch()">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="8" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            Araşdır (Ctrl+Enter)
+          </button>
+        </div>
+      </div>
+      <div class="research-output" id="research-output"></div>
+    </div>
+
+    <!-- ── CODE PANEL ── -->
+    <div class="panel" id="code-panel">
+      <div class="code-workspace">
+        <div class="code-sidebar">
+          <div class="code-sidebar-header">
+            Fayllar
+            <button onclick="showNewFileInput()" title="Yeni fayl">+</button>
+          </div>
+          <div class="file-list" id="file-list">
+            <div style="padding:10px;font-size:11px;color:var(--text-muted);font-style:italic">Fayl yoxdur</div>
+          </div>
+          <div class="code-new-file" id="new-file-row" style="display:none">
+            <input type="text" id="new-file-input" placeholder="fayl.js, index.html…"
+              onkeydown="handleNewFileKey(event)" onblur="hideNewFileInput()">
+          </div>
+        </div>
+        <div class="code-editor-area">
+          <div class="editor-tabs" id="editor-tabs">
+            <div style="padding:8px 14px;font-size:12px;color:var(--text-muted);font-style:italic">Fayl seç və ya yeni
+              yarat</div>
+          </div>
+          <div class="editor-container">
+            <div class="line-numbers" id="line-numbers"></div>
+            <textarea id="code-editor" placeholder="Kodu buraya yapışdır və ya yaz…" spellcheck="false"
+              oninput="updateLineNumbers();updateCodeAI()" onkeydown="handleEditorKey(event)"
+              onscroll="syncLineNumbers()"></textarea>
+          </div>
+          <div class="code-toolbar">
+            <button class="code-tool-btn green" onclick="runActiveFile()">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3" />
+              </svg>
+              İcra et
+            </button>
+            <button class="code-tool-btn" onclick="copyEditorContent()">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" />
+                <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+              </svg>
+              Kopyala
+            </button>
+            <button class="code-tool-btn" onclick="downloadActiveFile()">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              Yüklə
+            </button>
+            <button class="code-tool-btn" onclick="uploadCodeFile()">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+              Yüklə fayl
+            </button>
+            <input type="file" id="code-file-upload" style="display:none" accept=".js,.html,.css,.py,.ts,.json,.md,.txt"
+              onchange="handleCodeFileUpload(event)">
+            <span id="editor-status" style="margin-left:auto;font-size:11px;color:var(--text-muted)"></span>
+          </div>
+          <div class="code-run-output" id="code-run-output">
+            <div class="run-output-header">
+              <span id="run-output-label">▶ Nəticə</span>
+              <button class="close-output" onclick="closeRunOutput()">✕ Bağla</button>
+            </div>
+            <div id="run-output-body" class="run-output-body"></div>
+          </div>
+        </div>
+        <div class="code-ai-panel">
+          <div class="code-ai-header">
+            <div class="logo-icon" style="width:20px;height:20px;font-size:10px">C</div>
+            Claude Kod Köməkçisi
+          </div>
+          <div class="code-ai-messages" id="code-ai-messages">
+            <div class="code-ai-msg ai-msg">Salam! Kodu analiz edib, izah edib, düzəldib köməyinizə hazıram. Sual ver!
+              👨‍💻</div>
+          </div>
+          <div class="code-ai-input-area">
+            <textarea class="code-ai-input" id="code-ai-input" placeholder="Bu kodu izah et, xəta tap…"
+              onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendCodeAI()}"
+              oninput="autoResize(this)"></textarea>
+            <button class="code-ai-send" onclick="sendCodeAI()">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── TASKS PANEL ── -->
+    <div class="panel" id="tasks-panel">
+      <div class="tasks-header">
+        <h2>✅ Cowork — Tapşırıq İdarəetməsi</h2>
+        <p>Tapşırıq əlavə edin. Claude onu addım-addım yerinə yetirəcək.</p>
+      </div>
+      <div class="task-add-box">
+        <input type="text" id="task-input"
+          placeholder="Yeni tapşırıq… Məsələn: REST API üçün authentication sistemi yaz"
+          onkeydown="if(event.key==='Enter')addTask()">
+        <div class="task-add-actions">
+          <button class="task-add-btn" onclick="addTask()">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+            Tapşırıq Əlavə Et
+          </button>
+        </div>
+      </div>
+      <div class="tasks-list" id="tasks-list">
+        <div style="text-align:center;padding:40px;color:var(--text-muted);font-size:13px">
+          Hələ tapşırıq yoxdur. Yuxarıdan əlavə edin ⬆️
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SYSTEM PROMPT MODAL -->
+  <div class="modal-overlay hidden" id="sys-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">⚙️ Sistem Promptu</span>
+        <button class="modal-close" onclick="closeSysModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-label">Claude-a bir rol ver (istəyə görə)</div>
+        <textarea class="modal-textarea" id="sys-prompt-input"
+          placeholder="Məsələn: Sən təcrübəli bir Python proqramçısısın…"></textarea>
+        <select class="modal-select" id="preset-select" onchange="applyPreset(this.value)">
+          <option value="">— Hazır şablon seç —</option>
+          <option value="coder">👨‍💻 Kod ustası</option>
+          <option value="writer">✍️ Yazı köməkçisi</option>
+          <option value="teacher">📚 Müəllim</option>
+          <option value="analyst">📊 Data analitiki</option>
+          <option value="translator">🌍 Tərcüməçi</option>
+          <option value="researcher">🔬 Araşdırmaçı</option>
+        </select>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-ghost" onclick="clearSysPrompt()">Sil</button>
+        <button class="btn-ghost" onclick="closeSysModal()">Ləğv et</button>
+        <button class="btn-primary" onclick="saveSysPrompt()">Saxla</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- EXPORT MODAL -->
+  <div class="modal-overlay hidden" id="export-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">💾 Sohbeti İxrac Et</span>
+        <button class="modal-close" onclick="closeExportModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="export-options">
+          <button class="export-opt" onclick="exportAs('json')"><span class="export-opt-icon">{ }</span>
+            <div class="export-opt-info"><span class="export-opt-title">JSON Format</span><span
+                class="export-opt-desc">Proqramçılar üçün, tam məlumatla</span></div>
+          </button>
+          <button class="export-opt" onclick="exportAs('txt')"><span class="export-opt-icon">📄</span>
+            <div class="export-opt-info"><span class="export-opt-title">Düz Mətn (TXT)</span><span
+                class="export-opt-desc">Oxumaq üçün asan format</span></div>
+          </button>
+          <button class="export-opt" onclick="exportAs('md')"><span class="export-opt-icon">📝</span>
+            <div class="export-opt-info"><span class="export-opt-title">Markdown (MD)</span><span
+                class="export-opt-desc">Notion, Obsidian ilə uyğun</span></div>
+          </button>
+        </div>
+      </div>
+      <div class="modal-footer"><button class="btn-ghost" onclick="closeExportModal()">Bağla</button></div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    'use strict';
+
+    // ═══════════════════════════════════════════════════════════
+    // STORAGE KEYS
+    // ═══════════════════════════════════════════════════════════
+    const KEYS = {
+      memories: 'cpo_memories_v2',
+      conversations: 'cpo_conversations_v2',
+      settings: 'cpo_settings_v2',
+      codeFiles: 'cpo_code_files_v2',
+      tasks: 'cpo_tasks_v2'
+    };
+
+    function persist(key, data) {
+      try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) { console.warn('Storage error:', e); }
+    }
+    function load(key, def) {
+      try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : def; } catch (e) { return def; }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // STATE
+    // ═══════════════════════════════════════════════════════════
+    let memories = load(KEYS.memories, []);
+    let conversations = load(KEYS.conversations, []);
+    let settings = load(KEYS.settings, { model: 'claude-sonnet-4-5', systemPrompt: '', theme: 'dark' });
+    let codeFiles = load(KEYS.codeFiles, []);
+    let tasks = load(KEYS.tasks, []);
+
+    let chatHistory = [];
+    let currentConvId = null;
+    let isStreaming = false;
+    let pendingFiles = [];
+    let msgCounter = 0;
+    let currentMode = 'chat';
+    let currentModel = settings.model;
+    let systemPrompt = settings.systemPrompt;
+    let isDark = settings.theme === 'dark';
+
+    // Code workspace state
+    let activeFileId = codeFiles.length ? codeFiles[0].id : null;
+
+    // Research state
+    let researchRunning = false;
+
+    // Tasks state
+    // taskCounter removed — IDs use Date.now()
+
+    // Voice
+    let isRecording = false;
+    let recognition = null;
+
+    // ═══════════════════════════════════════════════════════════
+    // INIT
+    // ═══════════════════════════════════════════════════════════
+    (function init() {
+      // Apply theme
+      document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+      document.getElementById('theme-toggle').classList.toggle('on', !isDark);
+
+      // Apply saved model
+      const sel = document.getElementById('model-select');
+      sel.value = currentModel;
+
+      // Apply system prompt
+      document.getElementById('sys-prompt-input').value = systemPrompt;
+
+      renderMemories();
+      renderHistoryList();
+      renderFileList();
+      renderEditorTabs();
+      renderTasks();
+      updateLineNumbers();
+
+      if (activeFileId) {
+        const f = codeFiles.find(f => f.id === activeFileId);
+        if (f) document.getElementById('code-editor').value = f.content;
+      }
+
+      document.getElementById('textarea').focus();
+    })();
+
+    // ═══════════════════════════════════════════════════════════
+    // THEME
+    // ═══════════════════════════════════════════════════════════
+    function toggleTheme() {
+      isDark = !isDark;
+      document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+      document.getElementById('theme-toggle').classList.toggle('on', !isDark);
+      settings.theme = isDark ? 'dark' : 'light';
+      persist(KEYS.settings, settings);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // SIDEBAR
+    // ═══════════════════════════════════════════════════════════
+    function toggleSidebar() {
+      document.getElementById('sidebar').classList.toggle('collapsed');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // MODE SWITCHING
+    // ═══════════════════════════════════════════════════════════
+    function switchMode(mode) {
+      currentMode = mode;
+      document.querySelectorAll('.mode-tab').forEach(t => t.classList.remove('active'));
+      document.getElementById('tab-' + mode).classList.add('active');
+      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+      document.getElementById(mode + '-panel').classList.add('active');
+
+      const titles = { chat: 'Söhbet', research: 'Dərin Araşdırma', code: 'Kod Workspace', tasks: 'Cowork Tapşırıqlar' };
+      document.getElementById('topbar-title').textContent = titles[mode] || '';
+
+      if (mode === 'code') {
+        setTimeout(() => { updateLineNumbers(); }, 50);
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // MEMORY
+    // ═══════════════════════════════════════════════════════════
+    function renderMemories() {
+      const list = document.getElementById('memory-list');
+      const label = document.getElementById('memory-count-label');
+      if (label) label.textContent = memories.length + ' yaddaş';
+
+      if (!memories.length) {
+        list.innerHTML = '<div class="mem-empty">Yaddaş yoxdur. Əlavə edin.</div>';
+        return;
+      }
+      list.innerHTML = memories.map(m => `
+    <div class="memory-card">
+      <span class="mem-text">${esc(m.text)}</span>
+      <button class="mem-del" onclick="deleteMemory(${m.id})" title="Sil">✕</button>
+    </div>`).join('');
+    }
+
+    function addMemory(text) {
+      const t = text.trim();
+      if (!t) return;
+      memories.unshift({ id: Date.now(), text: t, date: new Date().toISOString() });
+      persist(KEYS.memories, memories);
+      renderMemories();
+    }
+
+    function addMemoryFromInput() {
+      const inp = document.getElementById('memory-input');
+      addMemory(inp.value);
+      inp.value = '';
+    }
+
+    function deleteMemory(id) {
+      memories = memories.filter(m => m.id !== id);
+      persist(KEYS.memories, memories);
+      renderMemories();
+      toast('Yaddaş silindi');
+    }
+
+    function getMemoryContext() {
+      if (!memories.length) return '';
+      return '\n\n[İSTİFADƏÇİ YADDAŞI — bu məlumatları nəzərə al]:\n' +
+        memories.map(m => '• ' + m.text).join('\n');
+    }
+
+    async function autoExtractMemory() {
+      if (!chatHistory.length) { toast('Söhbet yoxdur'); return; }
+      toast('🧠 Yaddaş çıxarılır…');
+      try {
+        const lastMsgs = chatHistory.slice(-6).map(m => {
+          const content = typeof m.content === 'string' ? m.content : '[fayl]';
+          return (m.role === 'user' ? 'İstifadəçi: ' : 'Claude: ') + content.slice(0, 300);
+        }).join('\n');
+
+        const resp = await puter.ai.chat(
+          `Bu söhbetdən istifadəçi haqqında qeyd edilməyə dəyər faktları, üstünlükləri, bacarıqları JSON array olaraq çıxar. Hər element qısa bir sətir olsun. Əgər heç nə yoxdursa boş array qaytar.\n\nSöhbet:\n${lastMsgs}\n\nYalnız JSON qaytarın, başqa heç nə: ["fakt1", "fakt2"]`,
+          { model: currentModel }
+        );
+
+        const text = typeof resp === 'string' ? resp : (resp?.message?.content?.[0]?.text || resp?.content?.[0]?.text || '');
+        const clean = text.replace(/```json|```/g, '').trim();
+        const facts = JSON.parse(clean);
+        if (Array.isArray(facts) && facts.length) {
+          facts.forEach(f => addMemory(f));
+          toast(`✅ ${facts.length} yaddaş əlavə edildi`);
+        } else {
+          toast('Çıxarılacaq məlumat tapılmadı');
+        }
+      } catch (e) {
+        toast('Yaddaş çıxarılmadı: ' + e.message);
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // HISTORY
+    // ═══════════════════════════════════════════════════════════
+    function renderHistoryList() {
+      const list = document.getElementById('history-list');
+      if (!conversations.length) {
+        list.innerHTML = '<div style="padding:8px 10px;font-size:11px;color:var(--text-muted);font-style:italic">Hələ sohbet yoxdur</div>';
+        return;
+      }
+      list.innerHTML = conversations.map(c => `
+    <div class="history-item ${c.id === currentConvId ? 'active' : ''}" onclick="loadConv('${c.id}')">
+      <span style="overflow:hidden;text-overflow:ellipsis">${esc(c.title)}</span>
+      <button class="del-conv" onclick="event.stopPropagation();delConv('${c.id}')">✕</button>
+    </div>`).join('');
+    }
+
+    function loadConv(id) {
+      const conv = conversations.find(c => c.id === id);
+      if (!conv) return;
+      currentConvId = id;
+      chatHistory = JSON.parse(JSON.stringify(conv.history));
+
+      // Rebuild UI from chatHistory — no raw HTML stored
+      const msgDiv = document.getElementById('messages');
+      msgDiv.innerHTML = '';
+      let msgIdx = 0;
+      for (const msg of chatHistory) {
+        const domId = msg._domId || ('msg-' + (++msgIdx));
+        if (msg.role === 'user') {
+          const text = typeof msg.content === 'string' ? msg.content : '';
+          msgDiv.insertAdjacentHTML('beforeend', buildUserHtml(domId, text, []));
+        } else if (msg.role === 'assistant') {
+          const text = typeof msg.content === 'string' ? msg.content : '';
+          msgDiv.insertAdjacentHTML('beforeend', `
+        <div class="msg-row" id="${domId}">
+          <div class="avatar ai">C</div>
+          <div class="msg-body">
+            <div class="msg-name">Claude</div>
+            <div class="msg-text" id="${domId}-text">${renderMarkdown(text)}</div>
+          </div>
+        </div>`);
+          // Re-attach copy/delete actions
+          setTimeout(() => addMsgActions(domId, text), 50);
+        }
+      }
+      document.getElementById('topbar-title').textContent = conv.title;
+      renderHistoryList();
+      scrollBottom();
+      switchMode('chat');
+    }
+
+    function delConv(id) {
+      conversations = conversations.filter(c => c.id !== id);
+      persist(KEYS.conversations, conversations);
+      if (currentConvId === id) newChat(true);
+      else renderHistoryList();
+      toast('Sohbet silindi');
+    }
+
+    function newChat(skipModeSwitch = false) {
+      chatHistory = [];
+      pendingFiles = [];
+      currentConvId = null;
+      document.getElementById('topbar-title').textContent = '';
+      document.getElementById('messages').innerHTML = `
+    <div id="welcome">
+      <div style="font-size:36px;margin-bottom:8px">✦</div>
+      <h1>Salam! Nə kömək edə bilərəm?</h1>
+      <p>Söhbet et, araşdır, kod yaz, tapşırıqları icra et — hər şeyə kömək edirəm.</p>
+      <div class="welcome-features">
+        <div class="feat-chip">🧠 Daimi Yaddaş</div>
+        <div class="feat-chip">🔬 Dərin Araşdırma</div>
+        <div class="feat-chip">&lt;/&gt; Kod Workspace</div>
+        <div class="feat-chip">✅ Cowork Tasks</div>
+        <div class="feat-chip">🎙️ Səslə Danış</div>
+        <div class="feat-chip">📎 Fayl Analiz</div>
+      </div>
+    </div>`;
+      const ta = document.getElementById('textarea');
+      ta.value = '';
+      autoResize(ta);
+      clearFileStrip();
+      updateSendBtn();
+      renderHistoryList();
+      if (!skipModeSwitch) switchMode('chat');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // SYSTEM PROMPT
+    // ═══════════════════════════════════════════════════════════
+    function openSysPromptModal() {
+      document.getElementById('sys-prompt-input').value = systemPrompt;
+      document.getElementById('sys-modal').classList.remove('hidden');
+    }
+    function closeSysModal() { document.getElementById('sys-modal').classList.add('hidden'); }
+    function clearSysPrompt() { document.getElementById('sys-prompt-input').value = ''; }
+    function saveSysPrompt() {
+      systemPrompt = document.getElementById('sys-prompt-input').value.trim();
+      settings.systemPrompt = systemPrompt;
+      persist(KEYS.settings, settings);
+      closeSysModal();
+      toast(systemPrompt ? '✅ Sistem promptu tətbiq edildi' : 'Sistem promptu silindi');
+    }
+
+    const PRESETS = {
+      coder: 'Sən ekspert bir proqramçısın. Hər zaman təmiz, effektiv, şərh edilmiş kod yaz. Azərbaycan dilinde cavab ver.',
+      writer: 'Sən peşəkar bir yazı köməkçisisən. Yazıları aydın, cəlbedici və düzgün dildə hazırla.',
+      teacher: 'Sən səbirli bir müəllimsən. Mürəkkəb mövzuları sadə misallarla izah et, addım-addım anlat.',
+      analyst: 'Sən data analitikisən. Rəqəmlər, trendlər və statistikaya diqqət et.',
+      translator: 'Sən çoxdilli tərcüməçisən. Dəqiq, təbii və kontekstə uyğun tərcümə et.',
+      researcher: 'Sən dərin araşdırmaçısın. Hər mövzunu çoxsaylı aspektdən incələ, mənbələrə istinad et.'
+    };
+    function applyPreset(val) {
+      if (val && PRESETS[val]) document.getElementById('sys-prompt-input').value = PRESETS[val];
+      document.getElementById('preset-select').value = '';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // CHAT — SEND MESSAGE (FIXED)
+    // ═══════════════════════════════════════════════════════════
+    function buildSystemContext() {
+      let ctx = systemPrompt || '';
+      const memCtx = getMemoryContext();
+      if (memCtx) ctx += memCtx;
+      return ctx;
+    }
+
+    async function sendMessage() {
+      if (isStreaming) return;
+      const ta = document.getElementById('textarea');
+      const text = ta.value.trim();
+      if (!text && !pendingFiles.length) return;
+
+      const files = [...pendingFiles];
+      clearFileStrip();
+      ta.value = '';
+      autoResize(ta);
+      updateSendBtn();
+
+      // Build user content
+      let userContent;
+      if (files.length > 0) {
+        userContent = [];
+        files.forEach(f => {
+          if (f.isImage) userContent.push({ type: 'image', source: { type: 'base64', media_type: f.type, data: f.base64 } });
+          else if (f.type === 'application/pdf') userContent.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: f.base64 } });
+          else userContent.push({ type: 'text', text: `[Fayl: ${f.name}]\n` });
+        });
+        if (text) userContent.push({ type: 'text', text });
+        else userContent.push({ type: 'text', text: 'Bu faylları analiz et.' });
+      } else {
+        userContent = text;
+      }
+
+      const msgId = 'msg-' + (++msgCounter);
+      chatHistory.push({ role: 'user', content: userContent, _domId: msgId });
+
+      appendHtml(buildUserHtml(msgId, text, files));
+      setTimeout(() => addUserMsgActions(msgId, text), 50);
+
+      const aiId = 'ai-' + (++msgCounter);
+      appendHtml(`
+    <div class="msg-row" id="${aiId}">
+      <div class="avatar ai">C</div>
+      <div class="msg-body">
+        <div class="msg-name">Claude</div>
+        <div class="msg-text" id="${aiId}-text"><span class="cursor"></span></div>
+      </div>
+    </div>`);
+      scrollBottom();
+
+      isStreaming = true;
+      updateSendBtn();
+      let fullText = '';
+      const textEl = document.getElementById(`${aiId}-text`);
+      const sysCtx = buildSystemContext();
+
+      try {
+        const opts = { model: currentModel, stream: true };
+        if (sysCtx) opts.system = sysCtx;
+
+        const cleanHistory = chatHistory.map(m => ({ role: m.role, content: m.content }));
+        const response = await puter.ai.chat(cleanHistory, opts);
+
+        for await (const part of response) {
+          const chunk = part?.text || part?.delta?.text || '';
+          if (chunk) {
+            fullText += chunk;
+            textEl.innerHTML = renderMarkdown(fullText) + '<span class="cursor"></span>';
+            scrollBottom();
+          }
+        }
+
+        textEl.innerHTML = renderMarkdown(fullText);
+        addMsgActions(aiId, fullText);
+        chatHistory.push({ role: 'assistant', content: fullText, _domId: aiId });
+        saveConversation(text || 'Fayl paylaşıldı');
+
+      } catch (err) {
+        textEl.innerHTML = `<span style="color:var(--red)">⚠️ Xəta: ${esc(err.message)}</span>`;
+        chatHistory.pop();
+        toast('Xəta: ' + err.message);
+      } finally {
+        isStreaming = false;
+        updateSendBtn();
+        ta.focus();
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // CHAT — SAVE CONVERSATION
+    // ═══════════════════════════════════════════════════════════
+    function saveConversation(firstMsg) {
+      const title = (firstMsg || 'Söhbet').slice(0, 45) + (firstMsg.length > 45 ? '…' : '');
+      const msgDiv = document.getElementById('messages');
+
+      if (currentConvId) {
+        const conv = conversations.find(c => c.id === currentConvId);
+        if (conv) {
+          conv.history = JSON.parse(JSON.stringify(chatHistory));
+          // Do NOT store innerHTML — reconstruct from history on load
+        }
+      } else {
+        currentConvId = 'c' + Date.now();
+        conversations.unshift({
+          id: currentConvId,
+          title,
+          history: JSON.parse(JSON.stringify(chatHistory))
+        });
+        if (conversations.length > 50) conversations.pop();
+        document.getElementById('topbar-title').textContent = title;
+      }
+      persist(KEYS.conversations, conversations);
+      renderHistoryList();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // CHAT — MESSAGE ACTIONS
+    // ═══════════════════════════════════════════════════════════
+    function deleteMsg(id) {
+      const el = document.getElementById(id);
+      if (el) el.remove();
+      // Also remove from in-memory chatHistory so it's not sent in future API calls
+      const idx = chatHistory.findIndex(m => m._domId === id);
+      if (idx !== -1) chatHistory.splice(idx, 1);
+    }
+
+    function addMsgActions(id, content) {
+      const row = document.getElementById(id);
+      if (!row) return;
+      row.insertAdjacentHTML('beforeend', `
+    <div class="msg-actions">
+      <button class="msg-action-btn" onclick="copyMsgText('${id}')">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>Kopyala
+      </button>
+      <button class="msg-action-btn" onclick="editMsg('${id}')">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4z"/></svg>Redaktə
+      </button>
+      <button class="msg-action-btn danger" onclick="deleteMsg('${id}')">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>Sil
+      </button>
+    </div>`);
+    }
+
+    function addUserMsgActions(id, text) {
+      const row = document.getElementById(id);
+      if (!row) return;
+      row.insertAdjacentHTML('beforeend', `
+    <div class="msg-actions">
+      <button class="msg-action-btn" onclick="copyText(${JSON.stringify(text)})">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>Kopyala
+      </button>
+      <button class="msg-action-btn danger" onclick="deleteMsg('${id}')">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>Sil
+      </button>
+    </div>`);
+    }
+
+    function copyMsgText(id) {
+      const el = document.getElementById(id + '-text');
+      if (!el) return;
+      navigator.clipboard.writeText(el.innerText).then(() => toast('✅ Kopyalandı'));
+    }
+    function copyText(text) {
+      navigator.clipboard.writeText(text).then(() => toast('✅ Kopyalandı'));
+    }
+
+    function editMsg(id) {
+      const textEl = document.getElementById(id + '-text');
+      if (!textEl) return;
+      const orig = textEl.innerText;
+      textEl.innerHTML = `
+    <textarea class="edit-area" id="${id}-edit">${esc(orig)}</textarea>
+    <div class="edit-btns">
+      <button class="edit-save" onclick="saveEdit('${id}')">Saxla</button>
+      <button class="edit-cancel" onclick="cancelEdit('${id}',${JSON.stringify(orig)})">Ləğv</button>
+    </div>`;
+      const ea = document.getElementById(id + '-edit');
+      ea.style.height = ea.scrollHeight + 'px';
+      ea.focus();
+    }
+    function saveEdit(id) {
+      const ea = document.getElementById(id + '-edit');
+      if (!ea) return;
+      const newText = ea.value;
+      document.getElementById(id + '-text').innerHTML = renderMarkdown(newText);
+      // Sync edit back to chatHistory using msg-id
+      const histIdx = chatHistory.findIndex(m => m._domId === id);
+      if (histIdx !== -1) chatHistory[histIdx].content = newText;
+      toast('✅ Mesaj yeniləndi');
+    }
+    function cancelEdit(id, orig) {
+      document.getElementById(id + '-text').innerHTML = renderMarkdown(orig);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // DEEP RESEARCH
+    // ═══════════════════════════════════════════════════════════
+    async function startResearch() {
+      if (researchRunning) return;
+      const query = document.getElementById('research-textarea').value.trim();
+      if (!query) { toast('Araşdırma mövzusu daxil edin'); return; }
+
+      const depthMap = { quick: 3, standard: 5, deep: 7 };
+      const depth = depthMap[document.getElementById('research-depth').value] || 5;
+
+      researchRunning = true;
+      document.getElementById('research-btn').disabled = true;
+      document.getElementById('research-btn').textContent = '⏳ Araşdırılır…';
+
+      const output = document.getElementById('research-output');
+      output.innerHTML = '';
+
+      try {
+        // ─ STEP 1: Research Plan
+        addResearchStep(output, 'plan', '📋 Araşdırma Planı', 'Suallar hazırlanır…');
+        const sysCtx = buildSystemContext();
+        const planOpts = { model: currentModel };
+        if (sysCtx) planOpts.system = sysCtx;
+
+        const planResp = await puter.ai.chat(
+          `Sen derin bir araştırmacısın. "${query}" mövzusunu araşdırmaq üçün ${depth} ədəd fərqli, dərin sual hazırla. Hər sual konkret bir aspekti əhatə etsin.\n\nYalnız JSON array qaytar: ["sual1","sual2","sual3"]`,
+          planOpts
+        );
+
+        const planText = extractText(planResp);
+        let questions;
+        try {
+          const clean = planText.replace(/```json|```/g, '').trim();
+          questions = JSON.parse(clean);
+          if (!Array.isArray(questions)) throw new Error('');
+        } catch {
+          questions = planText.split('\n').filter(l => l.trim()).slice(0, depth).map(l => l.replace(/^\d+\.\s*/, '').trim());
+        }
+        questions = questions.slice(0, depth);
+
+        updateResearchStep(output, 'plan', renderMarkdown(questions.map((q, i) => `${i + 1}. ${q}`).join('\n')));
+
+        // ─ STEP 2: Answer each question
+        const answers = [];
+        for (let i = 0; i < questions.length; i++) {
+          const q = questions[i];
+          // Capture the returned step element ID so we can update it later
+          const qStepId = addResearchStep(output, 'query', `🔍 Sual ${i + 1}/${questions.length}: ${q.slice(0, 60)}${q.length > 60 ? '…' : ''}`, 'Analiz edilir…');
+
+          const qOpts = { model: currentModel };
+          if (sysCtx) qOpts.system = sysCtx;
+          const qResp = await puter.ai.chat(
+            `Araşdırma mövzusu: "${query}"\n\nBu suala ətraflı, dəqiq cavab ver: "${q}"\n\nCavab: `,
+            qOpts
+          );
+          const answer = extractText(qResp);
+          answers.push({ q, a: answer });
+          // Use the actual element ID returned by addResearchStep
+          updateResearchStep(output, qStepId, renderMarkdown(answer));
+        }
+
+        // ─ STEP 3: Synthesis
+        addResearchStep(output, 'synthesis', '🧬 Sintez — Ümumi Hesabat', 'Hazırlanır…');
+        const synCtx = answers.map((x, i) => `Sual ${i + 1}: ${x.q}\nCavab: ${x.a}`).join('\n\n---\n\n');
+        const synOpts = { model: currentModel };
+        if (sysCtx) synOpts.system = sysCtx;
+
+        const synResp = await puter.ai.chat(
+          `"${query}" mövzusunda aparılan araşdırmanın bütün hissələrini sintez edib hərtərəfli bir hesabat yaz. Əsas nəticələri vurgula, ziddiyyətləri qeyd et.\n\nAraşdırma materialı:\n\n${synCtx}`,
+          synOpts
+        );
+        const synthesis = extractText(synResp);
+        updateResearchStep(output, 'synthesis', renderMarkdown(synthesis), 'done');
+
+        // ─ Export button
+        output.insertAdjacentHTML('beforeend', `
+      <button class="research-export-btn" onclick="exportResearch(${JSON.stringify(query)})">
+        💾 Hesabatı ixrac et
+      </button>`);
+
+        // Save to chat history
+        chatHistory.push({ role: 'user', content: `[Araşdırma]: ${query}`, _domId: 'msg-' + Date.now() });
+        chatHistory.push({ role: 'assistant', content: `# Araşdırma: ${query}\n\n${synthesis}`, _domId: 'ai-' + (Date.now() + 1) });
+        saveConversation('Araşdırma: ' + query);
+
+      } catch (err) {
+        output.insertAdjacentHTML('beforeend', `<div style="color:var(--red);padding:12px;background:var(--surface);border-radius:10px;border:1px solid rgba(248,113,113,.3)">⚠️ Xəta: ${esc(err.message)}</div>`);
+        toast('Araşdırma xətası: ' + err.message);
+      } finally {
+        researchRunning = false;
+        document.getElementById('research-btn').disabled = false;
+        document.getElementById('research-btn').innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Araşdır (Ctrl+Enter)';
+      }
+    }
+
+    let stepIdCounter = 0;
+    function addResearchStep(container, type, title, body) {
+      const id = 'rs-' + (++stepIdCounter);
+      const iconMap = { plan: '📋', query: '🔍', synthesis: '🧬', done: '✅' };
+      container.insertAdjacentHTML('beforeend', `
+    <div class="research-step" id="${id}" data-type="${type}">
+      <div class="research-step-header">
+        <div class="step-icon ${type}">${iconMap[type] || '•'}</div>
+        <span class="step-title">${esc(title)}</span>
+        <span class="step-badge"><span class="cursor"></span></span>
+      </div>
+      <div class="step-body">${body}</div>
+    </div>`);
+      container.scrollTop = container.scrollHeight;
+      return id;
+    }
+
+    function updateResearchStep(container, stepId, content, newType) {
+      // stepId can be an element ID like 'rs-3' (for query steps) or a type string like 'plan'/'synthesis'
+      let step;
+      if (stepId === 'synthesis' || stepId === 'plan') {
+        step = container.querySelector(`.research-step[data-type="${stepId}"]`);
+      } else {
+        // For query steps, stepId IS the element's id (e.g. 'rs-2')
+        step = container.querySelector(`#${stepId}`);
+      }
+
+      if (!step) return;
+      const body = step.querySelector('.step-body');
+      const badge = step.querySelector('.step-badge');
+      if (body) body.innerHTML = content;
+      if (badge) badge.innerHTML = newType === 'done' ? '<span style="color:var(--green);font-size:12px">✓ Tamamlandı</span>' : '✓';
+      if (newType) { step.dataset.type = newType; const icon = step.querySelector('.step-icon'); if (icon) { icon.className = 'step-icon ' + newType; icon.textContent = newType === 'done' ? '✅' : '🧬'; } }
+    }
+
+    function exportResearch(query) {
+      const steps = document.querySelectorAll('#research-output .research-step');
+      let md = `# Araşdırma: ${query}\n\n_${new Date().toLocaleString('az')}_\n\n`;
+      steps.forEach(s => {
+        const title = s.querySelector('.step-title')?.textContent || '';
+        const body = s.querySelector('.step-body')?.innerText || '';
+        md += `## ${title}\n\n${body}\n\n---\n\n`;
+      });
+      downloadBlob(md, `research-${Date.now()}.md`, 'text/markdown');
+      toast('✅ Hesabat yükləndi');
+    }
+
+    function extractText(resp) {
+      if (typeof resp === 'string') return resp;
+      if (resp?.message?.content?.[0]?.text) return resp.message.content[0].text;
+      if (resp?.content?.[0]?.text) return resp.content[0].text;
+      return String(resp);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // CODE WORKSPACE
+    // ═══════════════════════════════════════════════════════════
+    function renderFileList() {
+      const list = document.getElementById('file-list');
+      if (!codeFiles.length) {
+        list.innerHTML = '<div style="padding:10px;font-size:11px;color:var(--text-muted);font-style:italic">Fayl yoxdur</div>';
+        return;
+      }
+      list.innerHTML = codeFiles.map(f => `
+    <div class="file-item ${f.id === activeFileId ? 'active' : ''}" onclick="openFile(${f.id})">
+      <span>${fileTypeIcon(f.name)}</span>
+      <span style="overflow:hidden;text-overflow:ellipsis">${esc(f.name)}</span>
+      <button class="file-del" onclick="event.stopPropagation();deleteFile(${f.id})">✕</button>
+    </div>`).join('');
+    }
+
+    function renderEditorTabs() {
+      const tabs = document.getElementById('editor-tabs');
+      if (!codeFiles.length) {
+        tabs.innerHTML = '<div style="padding:8px 14px;font-size:12px;color:var(--text-muted);font-style:italic">Fayl seç və ya yeni yarat</div>';
+        return;
+      }
+      tabs.innerHTML = codeFiles.map(f => `
+    <div class="editor-tab ${f.id === activeFileId ? 'active' : ''}" onclick="openFile(${f.id})">
+      ${fileTypeIcon(f.name)} ${esc(f.name)}
+      <button class="tab-close" onclick="event.stopPropagation();deleteFile(${f.id})">✕</button>
+    </div>`).join('');
+    }
+
+    function openFile(id) {
+      activeFileId = id;
+      const f = codeFiles.find(f => f.id === id);
+      if (!f) return;
+      document.getElementById('code-editor').value = f.content;
+      renderFileList();
+      renderEditorTabs();
+      updateLineNumbers();
+      document.getElementById('editor-status').textContent = f.name;
+    }
+
+    function deleteFile(id) {
+      codeFiles = codeFiles.filter(f => f.id !== id);
+      persist(KEYS.codeFiles, codeFiles);
+      if (activeFileId === id) {
+        activeFileId = codeFiles.length ? codeFiles[0].id : null;
+        document.getElementById('code-editor').value = activeFileId ? codeFiles.find(f => f.id === activeFileId)?.content || '' : '';
+      }
+      renderFileList();
+      renderEditorTabs();
+      updateLineNumbers();
+    }
+
+    function showNewFileInput() {
+      const row = document.getElementById('new-file-row');
+      row.style.display = 'block';
+      const inp = document.getElementById('new-file-input');
+      inp.value = '';
+      inp.focus();
+    }
+    function hideNewFileInput() {
+      setTimeout(() => { document.getElementById('new-file-row').style.display = 'none'; }, 150);
+    }
+    function handleNewFileKey(e) {
+      if (e.key === 'Enter') {
+        const name = document.getElementById('new-file-input').value.trim();
+        if (!name) return;
+        createNewFile(name);
+        hideNewFileInput();
+      }
+      if (e.key === 'Escape') hideNewFileInput();
+    }
+
+    function createNewFile(name) {
+      const id = Date.now();
+      codeFiles.push({ id, name, content: '' });
+      persist(KEYS.codeFiles, codeFiles);
+      openFile(id);
+      renderFileList();
+      renderEditorTabs();
+      toast('✅ ' + name + ' yaradıldı');
+    }
+
+    // Auto-save on editor input
+    document.getElementById('code-editor').addEventListener('input', function () {
+      if (!activeFileId) return;
+      const f = codeFiles.find(f => f.id === activeFileId);
+      if (f) {
+        f.content = this.value;
+        persist(KEYS.codeFiles, codeFiles);
+      }
+      updateLineNumbers();
+    });
+
+    function updateLineNumbers() {
+      const editor = document.getElementById('code-editor');
+      const lnDiv = document.getElementById('line-numbers');
+      const lines = (editor.value.split('\n').length) || 1;
+      lnDiv.innerHTML = Array.from({ length: lines }, (_, i) => `<span class="line-num">${i + 1}</span>`).join('');
+    }
+
+    function syncLineNumbers() {
+      const editor = document.getElementById('code-editor');
+      const lnDiv = document.getElementById('line-numbers');
+      lnDiv.scrollTop = editor.scrollTop;
+    }
+
+    function handleEditorKey(e) {
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const ta = e.target;
+        const start = ta.selectionStart;
+        const end = ta.selectionEnd;
+        ta.value = ta.value.slice(0, start) + '  ' + ta.value.slice(end);
+        ta.selectionStart = ta.selectionEnd = start + 2;
+        updateLineNumbers();
+      }
+    }
+
+    function copyEditorContent() {
+      const v = document.getElementById('code-editor').value;
+      navigator.clipboard.writeText(v).then(() => toast('✅ Kopyalandı'));
+    }
+
+    function downloadActiveFile() {
+      const f = codeFiles.find(f => f.id === activeFileId);
+      if (!f) { toast('Fayl seçilməyib'); return; }
+      downloadBlob(f.content, f.name, 'text/plain');
+      toast('✅ ' + f.name + ' yükləndi');
+    }
+
+    function uploadCodeFile() {
+      document.getElementById('code-file-upload').click();
+    }
+    function handleCodeFileUpload(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const MAX_BYTES = 5 * 1024 * 1024; // 5MB
+      if (file.size > MAX_BYTES) { toast(`⚠️ ${file.name} 5MB limitini aşır.`); e.target.value = ''; return; }
+      const reader = new FileReader();
+      reader.onload = ev => {
+        const id = Date.now();
+        codeFiles.push({ id, name: file.name, content: ev.target.result });
+        persist(KEYS.codeFiles, codeFiles);
+        openFile(id);
+        renderFileList();
+        renderEditorTabs();
+        toast('✅ ' + file.name + ' yükləndi');
+      };
+      reader.readAsText(file);
+      e.target.value = '';
+    }
+
+    function runActiveFile() {
+      const f = codeFiles.find(f => f.id === activeFileId);
+      const content = f ? f.content : document.getElementById('code-editor').value;
+      if (!content.trim()) { toast('Kod boşdur'); return; }
+
+      const ext = (f?.name || '').split('.').pop().toLowerCase();
+      const outputDiv = document.getElementById('code-run-output');
+      const outputBody = document.getElementById('run-output-body');
+      const label = document.getElementById('run-output-label');
+
+      outputDiv.classList.add('visible');
+
+      if (ext === 'html' || content.trim().startsWith('<!DOCTYPE') || content.trim().startsWith('<html')) {
+        label.textContent = '▶ HTML Nəticəsi';
+        outputBody.className = 'run-output-body';
+        outputBody.innerHTML = '<iframe sandbox="allow-scripts allow-same-origin"></iframe>';
+        const iframe = outputBody.querySelector('iframe');
+        const doc = iframe.contentDocument || iframe.contentWindow.document;
+        doc.open(); doc.write(content); doc.close();
+        setTimeout(() => { iframe.style.height = Math.max(200, doc.body?.scrollHeight || 200) + 'px'; }, 100);
+
+      } else if (ext === 'js' || ext === 'javascript') {
+        label.textContent = '▶ JS Console Çıxışı';
+        outputBody.className = 'run-output-console';
+        const logs = [];
+        const origLog = console.log;
+        const origErr = console.error;
+        const origWarn = console.warn;
+
+        const capture = (...args) => {
+          logs.push(args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' '));
+          outputBody.textContent = logs.join('\n');
+        };
+        console.log = capture;
+        console.error = (...a) => { logs.push('❌ ' + a.join(' ')); outputBody.textContent = logs.join('\n'); };
+        console.warn = (...a) => { logs.push('⚠️ ' + a.join(' ')); outputBody.textContent = logs.join('\n'); };
+
+        try {
+          // eslint-disable-next-line no-new-func
+          const result = new Function(content)();
+          if (result !== undefined && !logs.length) logs.push('→ ' + JSON.stringify(result, null, 2));
+          if (!logs.length) logs.push('(Çıxış yoxdur)');
+          outputBody.textContent = logs.join('\n');
+        } catch (err) {
+          outputBody.textContent = '❌ ' + err.message;
+        } finally {
+          console.log = origLog;
+          console.error = origErr;
+          console.warn = origWarn;
+        }
+
+      } else if (ext === 'css') {
+        label.textContent = '▶ CSS Preview';
+        outputBody.className = 'run-output-body';
+        outputBody.innerHTML = `<iframe sandbox="allow-scripts allow-same-origin"></iframe>`;
+        const iframe = outputBody.querySelector('iframe');
+        const doc = iframe.contentDocument || iframe.contentWindow.document;
+        doc.open();
+        doc.write(`<!DOCTYPE html><html><head><style>${content}</style></head><body style="padding:20px;font-family:sans-serif"><h2>CSS tətbiq edildi</h2><p>Bir paraqraf mətni</p><button>Düymə</button></body></html>`);
+        doc.close();
+      } else {
+        toast('⚠️ Bu fayl tipini brauzerdə icra etmək mümkün deyil');
+      }
+    }
+
+    function closeRunOutput() {
+      document.getElementById('code-run-output').classList.remove('visible');
+    }
+
+    async function sendCodeAI() {
+      const input = document.getElementById('code-ai-input');
+      const msg = input.value.trim();
+      if (!msg || isStreaming) return;
+      input.value = '';
+      autoResize(input);
+
+      const editor = document.getElementById('code-editor');
+      const code = editor.value;
+      const f = codeFiles.find(f => f.id === activeFileId);
+      const fileName = f?.name || 'kod';
+
+      const messagesDiv = document.getElementById('code-ai-messages');
+      messagesDiv.insertAdjacentHTML('beforeend', `<div class="code-ai-msg user-msg">${esc(msg)}</div>`);
+
+      const aiMsgId = 'cai-' + Date.now();
+      messagesDiv.insertAdjacentHTML('beforeend', `<div class="code-ai-msg ai-msg" id="${aiMsgId}"><span class="cursor"></span></div>`);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+
+      isStreaming = true;
+      let fullText = '';
+      const aiEl = document.getElementById(aiMsgId);
+      const sysCtx = buildSystemContext();
+
+      try {
+        const prompt = `Fayl: ${fileName}\n\nKod:\n\`\`\`\n${code.slice(0, 3000)}\n\`\`\`\n\nSual: ${msg}`;
+        const opts = { model: currentModel, stream: true };
+        if (sysCtx) opts.system = sysCtx;
+
+        const response = await puter.ai.chat(prompt, opts);
+        for await (const part of response) {
+          const chunk = part?.text || part?.delta?.text || '';
+          if (chunk) {
+            fullText += chunk;
+            aiEl.innerHTML = renderMarkdown(fullText) + '<span class="cursor"></span>';
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+          }
+        }
+        aiEl.innerHTML = renderMarkdown(fullText);
+
+        // If response contains code block, offer to apply
+        if (fullText.includes('```')) {
+          const match = fullText.match(/```(?:\w+)?\n([\s\S]+?)```/);
+          if (match) {
+            aiEl.insertAdjacentHTML('beforeend', `
+          <div style="margin-top:8px">
+            <button style="background:var(--accent);border:none;color:#fff;font-size:11px;padding:4px 10px;border-radius:6px;cursor:pointer;font-family:var(--font)" onclick="applyCodeSuggestion(${JSON.stringify(match[1])})">
+              ✅ Kodu tətbiq et
+            </button>
+          </div>`);
+          }
+        }
+      } catch (err) {
+        aiEl.innerHTML = `<span style="color:var(--red)">⚠️ ${esc(err.message)}</span>`;
+      } finally {
+        isStreaming = false;
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      }
+    }
+
+    function applyCodeSuggestion(code) {
+      document.getElementById('code-editor').value = code;
+      updateLineNumbers();
+      if (activeFileId) {
+        const f = codeFiles.find(f => f.id === activeFileId);
+        if (f) { f.content = code; persist(KEYS.codeFiles, codeFiles); }
+      }
+      toast('✅ Kod tətbiq edildi');
+    }
+
+    function updateCodeAI() { }
+
+    function fileTypeIcon(name) {
+      const ext = name.split('.').pop().toLowerCase();
+      const icons = { js: '🟨', ts: '🔷', html: '🌐', css: '🎨', py: '🐍', json: '{}', md: '📝', txt: '📄' };
+      return icons[ext] || '📄';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // TASKS / COWORK
+    // ═══════════════════════════════════════════════════════════
+    function renderTasks() {
+      const list = document.getElementById('tasks-list');
+      if (!tasks.length) {
+        list.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted);font-size:13px">Hələ tapşırıq yoxdur. Yuxarıdan əlavə edin ⬆️</div>';
+        return;
+      }
+      list.innerHTML = tasks.map(t => buildTaskCard(t)).join('');
+    }
+
+    function buildTaskCard(t) {
+      const statusLabel = { pending: 'Gözləyir', 'in-progress': 'İcra olunur', done: 'Tamamlandı' };
+      const stepsHtml = t.steps?.length ? `
+    <div class="task-steps">
+      ${t.steps.map((s, i) => `
+        <div class="task-step">
+          <div class="step-num ${s.status}">${s.status === 'done' ? '✓' : s.status === 'current' ? '▶' : (i + 1)}</div>
+          <div class="step-text ${s.status}">${esc(s.text)}</div>
+        </div>`).join('')}
+    </div>` : '';
+      const resultHtml = t.result ? `<div class="task-ai-result">${renderMarkdown(t.result)}</div>` : '';
+
+      return `<div class="task-card" id="task-${t.id}">
+    <div class="task-card-header">
+      <div class="task-check ${t.status}" onclick="toggleTaskDone(${t.id})" title="Tamamlandı olaraq işarələ">
+        ${t.status === 'done' ? '✓' : ''}
+      </div>
+      <div class="task-info">
+        <div class="task-title ${t.status === 'done' ? 'done-text' : ''}">${esc(t.title)}</div>
+        <div class="task-meta">
+          <span class="task-status-badge ${t.status === 'pending' ? 'pending' : t.status === 'in-progress' ? 'progress' : 'done'}">${statusLabel[t.status] || t.status}</span>
+          ${t.steps?.length ? `<span>${t.steps.filter(s => s.status === 'done').length}/${t.steps.length} addım</span>` : ''}
+        </div>
+      </div>
+      <div class="task-btns">
+        ${t.status !== 'done' ? `<button class="task-btn execute" onclick="executeTask(${t.id})">⚡ Yerin. Yetir</button>` : ''}
+        <button class="task-btn del" onclick="deleteTask(${t.id})">✕</button>
+      </div>
+    </div>
+    ${stepsHtml}
+    ${resultHtml}
+  </div>`;
+    }
+
+    function addTask() {
+      const inp = document.getElementById('task-input');
+      const title = inp.value.trim();
+      if (!title) return;
+      inp.value = '';
+      const task = { id: Date.now(), title, status: 'pending', steps: [], result: '' };
+      tasks.unshift(task);
+      persist(KEYS.tasks, tasks);
+      renderTasks();
+      toast('✅ Tapşırıq əlavə edildi');
+    }
+
+    function deleteTask(id) {
+      tasks = tasks.filter(t => t.id !== id);
+      persist(KEYS.tasks, tasks);
+      renderTasks();
+      toast('Tapşırıq silindi');
+    }
+
+    function toggleTaskDone(id) {
+      const t = tasks.find(t => t.id === id);
+      if (!t) return;
+      t.status = t.status === 'done' ? 'pending' : 'done';
+      persist(KEYS.tasks, tasks);
+      renderTasks();
+    }
+
+    async function executeTask(id) {
+      if (isStreaming) { toast('Başqa əməliyyat davam edir'); return; }
+      const task = tasks.find(t => t.id === id);
+      if (!task) return;
+
+      isStreaming = true;
+      task.status = 'in-progress';
+      task.steps = [];
+      task.result = '';
+      renderTasks();
+
+      const sysCtx = buildSystemContext();
+
+      try {
+        // Step 1: Plan
+        const planOpts = { model: currentModel };
+        if (sysCtx) planOpts.system = sysCtx;
+        const planResp = await puter.ai.chat(
+          `Bu tapşırığı yerinə yetirmək üçün konkret addımları JSON array olaraq ver (5-7 addım): "${task.title}"\n\nYalnız JSON: ["addım1","addım2",…]`,
+          planOpts
+        );
+        const planText = extractText(planResp);
+        let steps;
+        try {
+          steps = JSON.parse(planText.replace(/```json|```/g, '').trim());
+          if (!Array.isArray(steps)) throw new Error('');
+        } catch {
+          steps = planText.split('\n').filter(l => l.trim()).map(l => l.replace(/^\d+\.\s*/, '').trim()).slice(0, 7);
+        }
+        task.steps = steps.map((s, i) => ({ id: i, text: s, status: 'pending' }));
+        renderTasks();
+
+        // Step 2: Execute each step
+        let fullResult = `# ${task.title}\n\n`;
+        for (let i = 0; i < task.steps.length; i++) {
+          task.steps[i].status = 'current';
+          renderTasks();
+
+          const stepOpts = { model: currentModel };
+          if (sysCtx) stepOpts.system = sysCtx;
+          const stepResp = await puter.ai.chat(
+            `Tapşırıq: "${task.title}"\n\nİndi bu addımı yerinə yetir: "${task.steps[i].text}"\n\nPraktik, konkret cavab ver.`,
+            stepOpts
+          );
+          const stepResult = extractText(stepResp);
+          fullResult += `## Addım ${i + 1}: ${task.steps[i].text}\n\n${stepResult}\n\n---\n\n`;
+
+          task.steps[i].status = 'done';
+          task.result = fullResult;
+          renderTasks();
+
+          // Small delay between steps
+          await new Promise(r => setTimeout(r, 200));
+        }
+
+        task.status = 'done';
+        task.result = fullResult;
+        persist(KEYS.tasks, tasks);
+        renderTasks();
+        toast('✅ Tapşırıq tamamlandı!');
+
+        // Also push to chat history
+        chatHistory.push({ role: 'user', content: `[Tapşırıq]: ${task.title}`, _domId: 'msg-' + Date.now() });
+        chatHistory.push({ role: 'assistant', content: fullResult, _domId: 'ai-' + (Date.now() + 1) });
+        saveConversation('Tapşırıq: ' + task.title);
+
+      } catch (err) {
+        task.status = 'pending';
+        task.result = '⚠️ Xəta: ' + err.message;
+        persist(KEYS.tasks, tasks);
+        renderTasks();
+        toast('Xəta: ' + err.message);
+      } finally {
+        isStreaming = false;
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // VOICE
+    // ═══════════════════════════════════════════════════════════
+    function toggleVoice() {
+      if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
+        toast('⚠️ Brauzeriniz səs tanımağı dəstəkləmir');
+        return;
+      }
+      isRecording ? stopVoice() : startVoice();
+    }
+    function startVoice() {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recognition = new SR();
+      recognition.lang = 'az-AZ';
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.onstart = () => { isRecording = true; document.getElementById('voice-btn').classList.add('recording'); toast('🎙️ Danışın…'); };
+      recognition.onresult = e => {
+        const t = Array.from(e.results).map(r => r[0].transcript).join('');
+        document.getElementById('textarea').value = t;
+        autoResize(document.getElementById('textarea'));
+        updateSendBtn();
+      };
+      recognition.onend = () => stopVoice();
+      recognition.onerror = () => { stopVoice(); toast('⚠️ Səs tanıma xətası'); };
+      recognition.start();
+    }
+    function stopVoice() {
+      isRecording = false;
+      document.getElementById('voice-btn').classList.remove('recording');
+      if (recognition) { recognition.stop(); recognition = null; }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // FILE HANDLING
+    // ═══════════════════════════════════════════════════════════
+    async function handleFileSelect(e) {
+      const MAX_BYTES = 5 * 1024 * 1024; // 5MB
+      for (const file of Array.from(e.target.files)) {
+        if (file.size > MAX_BYTES) { toast(`⚠️ ${file.name} 5MB limitini aşır, atlandı.`); continue; }
+        const base64 = await toBase64(file);
+        const isImage = file.type.startsWith('image/');
+        const dataUrl = `data:${file.type};base64,${base64}`;
+        pendingFiles.push({ name: file.name, type: file.type, base64, isImage, dataUrl });
+      }
+      e.target.value = '';
+      renderFileStrip();
+      updateSendBtn();
+    }
+    function toBase64(file) {
+      return new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(r.result.split(',')[1]);
+        r.onerror = rej;
+        r.readAsDataURL(file);
+      });
+    }
+    function removeFile(idx) { pendingFiles.splice(idx, 1); renderFileStrip(); updateSendBtn(); }
+    function renderFileStrip() {
+      const strip = document.getElementById('file-strip');
+      strip.innerHTML = pendingFiles.map((f, i) =>
+        f.isImage
+          ? `<div class="img-thumb-pill"><img src="${f.dataUrl}" alt="${esc(f.name)}"><button onclick="removeFile(${i})">✕</button></div>`
+          : `<div class="file-pill"><span>${fileIcon(f.type)}</span><span>${esc(f.name)}</span><button onclick="removeFile(${i})">✕</button></div>`
+      ).join('');
+      strip.classList.toggle('has-files', pendingFiles.length > 0);
+    }
+    function clearFileStrip() {
+      pendingFiles = [];
+      const s = document.getElementById('file-strip');
+      s.innerHTML = '';
+      s.classList.remove('has-files');
+    }
+    function fileIcon(type) {
+      if (type === 'application/pdf') return '📄';
+      if (type.startsWith('image/')) return '🖼️';
+      if (type.includes('json')) return '{}';
+      if (type.includes('csv')) return '📊';
+      return '📝';
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // EXPORT
+    // ═══════════════════════════════════════════════════════════
+    function openExportModal() {
+      if (!chatHistory.length) { toast('İxrac etmək üçün sohbet başladın'); return; }
+      document.getElementById('export-modal').classList.remove('hidden');
+    }
+    function closeExportModal() { document.getElementById('export-modal').classList.add('hidden'); }
+    function exportAs(fmt) {
+      const date = new Date().toISOString().slice(0, 10);
+      const title = conversations.find(c => c.id === currentConvId)?.title || 'sohbet';
+      let content, filename, type;
+      if (fmt === 'json') {
+        content = JSON.stringify({ title, date, model: currentModel, systemPrompt, memories, messages: chatHistory }, null, 2);
+        filename = `claude-${date}.json`; type = 'application/json';
+      } else if (fmt === 'txt') {
+        content = chatHistory.map(m => `[${m.role === 'user' ? 'SİZ' : 'CLAUDE'}]\n${typeof m.content === 'string' ? m.content : '[Fayl]'}\n`).join('\n---\n\n');
+        filename = `claude-${date}.txt`; type = 'text/plain';
+      } else {
+        content = `# ${title}\n_${date} · ${currentModel}_\n\n` +
+          chatHistory.map(m => `${m.role === 'user' ? '**Siz**' : '**Claude**'}\n\n${typeof m.content === 'string' ? m.content : '_[Fayl]_'}`).join('\n\n---\n\n');
+        filename = `claude-${date}.md`; type = 'text/markdown';
+      }
+      downloadBlob(content, filename, type);
+      closeExportModal();
+      toast('✅ Fayl yükləndi: ' + filename);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // MARKDOWN RENDERER
+    // ═══════════════════════════════════════════════════════════
+    function renderMarkdown(text) {
+      // 1. Extract code blocks and inline code first to avoid HTML-clash
+      const codeBlocks = [];
+      text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+        const id = 'cb-' + Math.random().toString(36).slice(2);
+        const canRun = ['html', 'css', 'javascript', 'js'].includes((lang || '').toLowerCase());
+        const runBtn = canRun ? `<button class="code-btn run" onclick="runInlineCode('${id}','${(lang || '').toLowerCase()}')">▶ İcra</button>` : '';
+        const html = `<div class="code-block">
+      <div class="code-header">
+        <span class="code-lang">${lang || 'kod'}</span>
+        <div class="code-btns">${runBtn}<button class="code-btn" onclick="copyCode('${id}')">Kopyala</button><button class="code-btn" onclick="openInWorkspace('${id}','${esc(lang || 'txt')}')">Workspace-ə aç</button></div>
+      </div>
+      <pre><code id="${id}">${escHtml(code.trim())}</code></pre>
+    </div>`;
+        const placeholder = `\0CODEBLOCK${codeBlocks.length}\0`;
+        codeBlocks.push(html);
+        return placeholder;
+      });
+      // Inline code — after block extraction, safe to replace
+      text = text.replace(/`([^`\n]+)`/g, (_, c) => {
+        const html = `<code style="background:var(--code-bg);padding:2px 6px;border-radius:4px;font-size:12.5px;font-family:var(--mono)">${escHtml(c)}</code>`;
+        const placeholder = `\0CODEBLOCK${codeBlocks.length}\0`;
+        codeBlocks.push(html);
+        return placeholder;
+      });
+      // Bold, italic
+      text = text.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+      text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
+      // Headers
+      text = text.replace(/^### (.+)$/gm, '<div style="font-size:14px;font-weight:600;margin:14px 0 4px">$1</div>');
+      text = text.replace(/^## (.+)$/gm, '<div style="font-size:16px;font-weight:600;margin:16px 0 6px">$1</div>');
+      text = text.replace(/^# (.+)$/gm, '<div style="font-size:19px;font-weight:700;margin:18px 0 8px">$1</div>');
+      // HR
+      text = text.replace(/^---$/gm, '<hr style="border:none;border-top:1px solid var(--border);margin:14px 0">');
+      // Lists
+      text = text.replace(/^[\-\*] (.+)$/gm, '<div style="padding-left:16px;margin:3px 0;display:flex;gap:8px"><span style="color:var(--accent);margin-top:2px">•</span><span>$1</span></div>');
+      text = text.replace(/^\d+\. (.+)$/gm, '<div style="padding-left:16px;margin:3px 0">$1</div>');
+      // Line breaks
+      text = text.replace(/\n\n/g, '<br><br>').replace(/\n/g, '<br>');
+      // 2. Restore code blocks
+      text = text.replace(/\0CODEBLOCK(\d+)\0/g, (_, i) => codeBlocks[parseInt(i)]);
+      return text;
+    }
+
+    function copyCode(id) {
+      const el = document.getElementById(id);
+      if (el) navigator.clipboard.writeText(el.textContent).then(() => toast('✅ Kopyalandı'));
+    }
+
+    function openInWorkspace(id, lang) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const ext = lang === 'javascript' ? 'js' : lang || 'txt';
+      const name = 'snippet-' + Date.now() + '.' + ext;
+      const fileId = Date.now();
+      codeFiles.push({ id: fileId, name, content: el.textContent });
+      persist(KEYS.codeFiles, codeFiles);
+      activeFileId = fileId;
+      switchMode('code');
+      document.getElementById('code-editor').value = el.textContent;
+      renderFileList();
+      renderEditorTabs();
+      updateLineNumbers();
+      toast('✅ Kod workspace-ə açıldı');
+    }
+
+    function runInlineCode(id, lang) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const code = el.textContent;
+      const block = el.closest('.code-block');
+
+      const existing = block.querySelector('.code-output');
+      if (existing) { existing.remove(); return; }
+
+      if (lang === 'html') {
+        const iframe = document.createElement('iframe');
+        iframe.sandbox = 'allow-scripts allow-same-origin';
+        const div = document.createElement('div'); div.className = 'code-output';
+        div.innerHTML = '<div class="code-output-header"><span class="output-label">▶ Nəticə</span><button class="close-output" onclick="this.closest(\'.code-output\').remove()">✕</button></div>';
+        div.appendChild(iframe); block.appendChild(div);
+        const doc = iframe.contentDocument || iframe.contentWindow.document;
+        doc.open(); doc.write(code); doc.close();
+        setTimeout(() => { iframe.style.height = Math.max(200, doc.body?.scrollHeight || 200) + 'px'; }, 100);
+      } else if (lang === 'js' || lang === 'javascript') {
+        const div = document.createElement('div'); div.className = 'code-output';
+        const outId = 'out-' + Date.now();
+        div.innerHTML = `<div class="code-output-header"><span class="output-label">▶ Console</span><button class="close-output" onclick="this.closest('.code-output').remove()">✕</button></div><pre style="padding:12px 16px;font-family:var(--mono);font-size:12px;color:#e0e0e0;background:var(--code-bg);max-height:200px;overflow-y:auto" id="${outId}"></pre>`;
+        block.appendChild(div);
+        const outEl = document.getElementById(outId);
+        const logs = [];
+        const origLog = console.log;
+        const origErr = console.error;
+        console.log = (...args) => { logs.push(args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')); outEl.textContent = logs.join('\n'); };
+        console.error = (...args) => { logs.push('❌ ' + args.join(' ')); outEl.textContent = logs.join('\n'); };
+        try {
+          const res = new Function(code)();
+          if (res !== undefined && !logs.length) logs.push('→ ' + JSON.stringify(res));
+          if (!logs.length) logs.push('(Çıxış yoxdur)');
+          outEl.textContent = logs.join('\n');
+        } catch (err) {
+          outEl.innerHTML = `<span style="color:var(--red)">❌ ${esc(err.message)}</span>`;
+        } finally {
+          console.log = origLog;
+          console.error = origErr;
+        }
+      } else {
+        toast('⚠️ Bu dilin brauzerdə icrası dəstəklənmir');
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // HTML BUILDERS
+    // ═══════════════════════════════════════════════════════════
+    function buildUserHtml(id, text, files) {
+      const filesHtml = files.map(f =>
+        f.isImage
+          ? `<img class="msg-img-preview" src="${f.dataUrl}" alt="${esc(f.name)}">`
+          : `<div class="msg-file-chip">${fileIcon(f.type)} ${esc(f.name)}</div>`
+      ).join('');
+      return `<div class="msg-row" id="${id}">
+    <div class="avatar user">S</div>
+    <div class="msg-body">
+      <div class="msg-name">Siz</div>
+      ${filesHtml ? `<div class="msg-files">${filesHtml}</div>` : ''}
+      ${text ? `<div class="msg-text">${esc(text)}</div>` : ''}
+    </div>
+  </div>`;
+    }
+
+    function appendHtml(html) {
+      const w = document.getElementById('welcome');
+      if (w) w.remove();
+      document.getElementById('messages').insertAdjacentHTML('beforeend', html);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // UTILS
+    // ═══════════════════════════════════════════════════════════
+    function esc(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function escHtml(s) { return esc(s); }
+
+    function autoResize(el) {
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+    }
+
+    function updateSendBtn() {
+      const ta = document.getElementById('textarea');
+      document.getElementById('send-btn').disabled = (!ta.value.trim() && !pendingFiles.length) || isStreaming;
+    }
+
+    function handleKey(e) {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    }
+
+    function scrollBottom() {
+      requestAnimationFrame(() => {
+        const m = document.getElementById('messages');
+        m.scrollTop = m.scrollHeight;
+      });
+    }
+
+    let toastTimer;
+    function toast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+    }
+
+    function downloadBlob(content, filename, type) {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    // Close modals on overlay click
+    document.getElementById('sys-modal').addEventListener('click', e => { if (e.target === e.currentTarget) closeSysModal(); });
+    document.getElementById('export-modal').addEventListener('click', e => { if (e.target === e.currentTarget) closeExportModal(); });
+
+    // Export btn shortcut in topbar
+    document.getElementById('topbar').insertAdjacentHTML('beforeend',
+      `<button class="mode-tab" onclick="openExportModal()" style="flex-shrink:0">💾 İxrac</button>`);
+  </script>
+</body>
+
+</html>

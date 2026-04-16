@@ -1,0 +1,76 @@
+/* Dashboard / Cowork / Research Styles */
+.cowork-layout, .research-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.tasks-header, .research-header {
+  border-bottom: 1px solid var(--glass-border);
+  padding-bottom: 15px;
+  margin-bottom: 20px;
+}
+
+.task-item {
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--glass-border);
+  padding: 16px;
+  border-radius: var(--radius);
+  transition: all 0.2s ease;
+  margin-bottom: 10px;
+}
+
+.task-item:hover {
+  background: rgba(0, 0, 0, 0.3);
+  border-color: rgba(255,255,255,0.2);
+}
+
+.research-step {
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--glass-border);
+  padding: 16px;
+  border-radius: var(--radius);
+  margin-bottom: 15px;
+  animation: fadeIn 0.3s ease;
+}
+
+.research-step.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 10px rgba(99, 102, 241, 0.2);
+}
+
+.research-step-title {
+  font-weight: 600;
+  font-size: 15px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.step-body {
+  margin-top: 10px;
+  overflow-x: hidden;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+.step-body img {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--glass-border);
+}
+
+.cursor {
+  display: inline-block;
+  width: 8px;
+  height: 15px;
+  background: var(--text);
+  animation: blink 1s step-start infinite;
+  margin-left: 2px;
+  vertical-align: middle;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}

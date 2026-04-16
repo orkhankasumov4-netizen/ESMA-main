@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="az" data-theme="dark">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Claude Pro - SPA</title>
+
+  <meta name="description" content="Claude Pro - AI-powered chat, code editor, task management, and deep research platform">
+
+  <!-- CSS -->
+  <link rel="stylesheet" href="css/main.css">
+  <link rel="stylesheet" href="css/sidebar.css">
+  <link rel="stylesheet" href="css/chat.css">
+  <link rel="stylesheet" href="css/code.css">
+  <link rel="stylesheet" href="css/dashboard.css">
+  <link rel="stylesheet" href="css/mobile.css">
+
+  <!-- Monaco Editor -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.38.0/min/vs/loader.min.js"></script>
+
+</head>
+
+<body>
+
+  <!-- Mobile Hamburger Button -->
+  <button id="mobile-menu-btn" aria-label="Toggle navigation menu">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <line x1="3" y1="6" x2="21" y2="6"/>
+      <line x1="3" y1="12" x2="21" y2="12"/>
+      <line x1="3" y1="18" x2="21" y2="18"/>
+    </svg>
+  </button>
+
+  <!-- Sidebar Overlay -->
+  <div id="sidebar-overlay"></div>
+
+  <div id="app-container">
+    <!-- SIDEBAR -->
+    <aside id="sidebar" class="glass-panel">
+      <div class="sidebar-header">
+        <div class="logo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+          </svg>
+          Claude Pro
+        </div>
+      </div>
+
+      <nav class="nav-links">
+        <a href="#chat" class="nav-link active" data-page="chat-page">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+          </svg>
+          Chat
+        </a>
+        <a href="#code" class="nav-link" data-page="code-page">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="16 18 22 12 16 6"></polyline>
+            <polyline points="8 6 2 12 8 18"></polyline>
+          </svg>
+          Code Editor
+        </a>
+        <a href="#cowork" class="nav-link" data-page="cowork-page">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+            <circle cx="9" cy="7" r="4"></circle>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+          </svg>
+          Cowork (Tasks)
+        </a>
+        <a href="#research" class="nav-link" data-page="research-page">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          Deep Research
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <select id="model-select" class="model-selector">
+          <option value="openrouter">OpenRouter (Free)</option>
+          <option value="openai" selected>GPT-4o Mini</option>
+          <option value="gemini">Gemini 1.5 Flash</option>
+          <option value="qwen">Qwen Turbo</option>
+          <option value="mistral">Mistral Small</option>
+          <option value="groq">Groq (Llama 3)</option>
+        </select>
+        <button id="export-btn" class="btn-secondary" style="margin-top: 10px; width: 100%; font-size: 13px;">💾 İxrac
+          Et</button>
+      </div>
+    </aside>
+
+    <!-- MAIN CONTENT -->
+    <main id="main-content">
+
+      <!-- CHAT PAGE -->
+      <section id="chat-page" class="page active">
+        <div class="chat-layout">
+          <div id="messages" class="messages">
+            <!-- Welcome Screen -->
+            <div id="welcome" style="text-align: center; margin: auto; max-width: 600px; animation: fadeIn 0.5s ease;">
+              <h2 style="font-size: 28px; margin-bottom: 12px; color: #fff;">Sizə necə kömək edə bilərəm?</h2>
+              <p style="color: var(--text-muted); font-size: 15px;">Kod, dizayn, analiz və ya ümumi suallarınız üçün
+                yazın.</p>
+            </div>
+          </div>
+
+          <div class="input-area">
+            <div id="file-strip" style="display:flex; gap:10px; overflow-x:auto;"></div>
+            <div class="input-container">
+              <label for="file-upload" class="chat-btn btn-secondary" style="cursor: pointer;" title="Fayl Yüklə">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path
+                    d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48">
+                  </path>
+                </svg>
+              </label>
+              <input type="file" id="file-upload" multiple style="display:none">
+
+              <button id="voice-btn" class="chat-btn btn-secondary" title="Səslə yaz">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"></path>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                  <line x1="12" y1="19" x2="12" y2="23"></line>
+                  <line x1="8" y1="23" x2="16" y2="23"></line>
+                </svg>
+              </button>
+
+              <textarea id="chat-input" class="chat-textarea"
+                placeholder="Mesajınızı yazın... (Enter ilə göndərin)"></textarea>
+
+              <button id="send-btn" class="chat-btn btn-send" disabled>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="22" y1="2" x2="11" y2="13"></line>
+                  <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CODE PAGE -->
+      <section id="code-page" class="page">
+        <div class="glass-panel code-layout" style="flex:1; display:flex; gap: 10px; overflow:hidden; padding: 10px;">
+          <!-- Left: Monaco Editor -->
+          <div id="monaco-editor-container" style="flex:2; border-radius: var(--radius-sm); overflow:hidden;"></div>
+          <!-- Right: Output/Console -->
+          <div id="code-output-container" class="glass-panel" style="flex:1; display:flex; flex-direction:column;">
+            <div style="padding: 10px; border-bottom: 1px solid var(--glass-border); font-weight: 600;">Output / Console
+            </div>
+            <pre id="code-console"
+              style="flex:1; padding: 10px; overflow:auto; font-family: var(--font-mono); font-size: 13px;"></pre>
+            <button id="run-code-btn" class="btn-primary" style="margin: 10px;">▶ İcra Et</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- COWORK PAGE -->
+      <section id="cowork-page" class="page">
+        <div class="glass-panel cowork-layout" style="flex:1; overflow:hidden; padding: 20px;">
+          <div class="tasks-header">
+            <h2 style="font-size:18px;">✅ Cowork — Tapşırıq İdarəetməsi</h2>
+            <p style="color:var(--text-muted);font-size:13px;margin-bottom:15px;">
+              Tapşırıq əlavə edin. Claude onu addım-addım yerinə yetirəcək.
+            </p>
+          </div>
+          <div class="task-add-box" style="display:flex;gap:10px;margin-bottom:20px;">
+            <input type="text" id="task-input" class="chat-textarea"
+              style="flex:1;min-height:40px;height:40px;padding:10px;border-radius:var(--radius-sm);"
+              placeholder="Yeni tapşırıq… Məsələn: REST API üçün authentication sistemi yaz">
+            <button class="btn-primary" id="task-add-btn" style="padding:0 20px;height:40px;white-space:nowrap;">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                style="margin-right:5px;vertical-align:middle;">
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+              Əlavə Et
+            </button>
+          </div>
+          <div class="tasks-list" id="tasks-list"
+            style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:10px;padding-right:5px;">
+            <div id="tasks-empty" style="text-align:center;padding:40px;color:var(--text-muted);font-size:13px">
+              Hələ tapşırıq yoxdur. Yuxarıdan əlavə edin ⬆️
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- RESEARCH PAGE -->
+      <section id="research-page" class="page">
+        <div class="glass-panel research-layout" style="flex:1; overflow:hidden; padding: 20px;">
+          <div class="research-header">
+            <h2 style="font-size:18px;">🔬 Dərin Araşdırma</h2>
+            <p style="color:var(--text-muted);font-size:13px;margin-bottom:15px;">
+              Mövzunu daxil edin. Claude araşdırma planı quracaq, hər sualı təhlil edəcək və hərtərəfli hesabat
+              hazırlayacaq.
+            </p>
+          </div>
+          <div class="research-input-box" style="display:flex;flex-direction:column;gap:10px;margin-bottom:20px;">
+            <textarea id="research-textarea" class="chat-textarea"
+              placeholder="Araşdırma mövzusunu yazın… Məsələn: Azərbaycanda AI inkişafı…"
+              style="min-height:80px;"></textarea>
+            <div class="research-actions" style="display:flex;justify-content:space-between;align-items:center;">
+              <select class="model-selector" id="research-depth" style="max-width:200px;">
+                <option value="quick">⚡ Sürətli (3 mərhələ)</option>
+                <option value="standard" selected>📊 Standart (5 mərhələ)</option>
+                <option value="deep">🔭 Dərin (7 mərhələ)</option>
+              </select>
+              <button class="btn-primary" id="research-btn" style="padding:8px 16px;">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  style="margin-right:5px;vertical-align:middle;">
+                  <circle cx="11" cy="11" r="8"></circle>
+                  <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                Araşdır
+              </button>
+            </div>
+          </div>
+          <div class="research-output" id="research-output" style="overflow-y:auto;flex:1;padding-right:10px;"></div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <div id="toast"></div>
+
+  <!-- JS Modules -->
+  <script type="module" src="js/app.js"></script>
+
+</body>
+
+</html>
